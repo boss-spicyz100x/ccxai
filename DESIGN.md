@@ -319,6 +319,32 @@ Two things only independent verification caught:
 The second is the more interesting one: the worker did the job correctly and still left a
 judgement call on the table. Reviewing the diff is not just defect-hunting.
 
+## 6d. What parallel fan-out found
+
+Four workers, four git worktrees, dispatched in the same second to write four
+independent test files. The first attempt returned four `partial` envelopes and
+zero files, every one honestly reporting `run_terminal_command ... cancelled`.
+
+The cause was in the write profile, not the fan-out. Under
+`--permission-mode acceptEdits`, read-only shell (`ls`) runs but any
+filesystem-mutating shell command — `touch`, `mkdir`, `echo > file` — is silently
+**cancelled**: one turn, empty output, no error. Reproduced with no ccx involved
+and no deny rules at all, so it is grok's behaviour. `bypassPermissions` works.
+
+`acceptEdits` auto-accepts *tool*-based edits but routes mutating *shell* commands
+through a confirmation path that headless resolves to `cancelled`. The earlier
+end-to-end write test passed only because it used the edit tool plus a read-only
+`python3` — the write profile had never once created a file via bash.
+
+The fix is `bypassPermissions` for the write profile, matching what `--read`
+already does: the kernel sandbox and the deny rules are the boundary, not the
+permission mode. Both were verified to still hold under it — `git push` is denied
+by policy, and a `touch` outside the workspace fails with `Operation not permitted`.
+
+Two recent additions paid for themselves here: the empty-envelope guard turned a
+silent exit 0 into exit 5, and the honest-reporting worker rule is why four
+workers said "I did not write the file" instead of inventing success.
+
 ## 7. What was built
 
 ```

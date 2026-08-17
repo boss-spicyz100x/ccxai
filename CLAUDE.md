@@ -48,3 +48,18 @@ wins. The CLI auto-updates and drops flags across majors (1.0 removed `--check` 
 Linux/Landlock only and a **no-op on macOS** — verified with a curl canary returning 200.
 
 Verify with a canary before documenting any safety property.
+
+## Running the tests
+
+```bash
+for t in tests/*.sh; do "$t" || echo "FAILED: $t"; done
+```
+
+Five files, 48 assertions, all using a stub `GROK_BIN` and a throwaway `CCX_HOME` —
+no test dispatches a real worker or spends money.
+
+**A test here is only finished when it fails on the bug it guards.** Every one of
+these was accepted by breaking `ccx` in the specific way the test targets and
+confirming it goes red — because the first version of `phase-parity.sh` passed
+both the working code and two genuinely broken variants, and that hid real
+containment bugs for several commits.

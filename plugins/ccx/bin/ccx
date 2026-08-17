@@ -544,7 +544,12 @@ fi
 declare -a SAFE=() ARGS=()
 if [[ "$PROFILE" == "write" ]]; then
   SANDBOX=workspace
-  SAFE+=(--sandbox "$SANDBOX" --permission-mode acceptEdits --allow "Bash")
+  # bypassPermissions, not acceptEdits. acceptEdits auto-accepts *tool* edits but routes
+  # filesystem-mutating SHELL commands (touch, mkdir, echo >f) through a confirmation
+  # path that headless silently resolves to stopReason=cancelled -- 1 turn, empty output,
+  # no error. Containment does not depend on the permission mode: the kernel sandbox and
+  # the deny rules below are both verified to still apply under bypassPermissions.
+  SAFE+=(--sandbox "$SANDBOX" --permission-mode bypassPermissions --allow "Bash")
   SAFE+=(--deny "Bash(sudo*)" --deny "Bash(rm -rf /*)" --deny "Bash(git push*)"
          --deny "Bash(git reset --hard*)" --deny "Bash(gh*)" --deny "Bash(npm publish*)"
          --deny "Edit(**/.env*)" --deny "Write(**/.env*)")
