@@ -13,8 +13,16 @@ set -euo pipefail
 unset CDPATH  # else `cd "$x" && pwd` echoes the resolved path too, doubling CWD
 
 VERSION="0.1.0"
-CCX_HOME="${CCX_HOME:-$HOME/.ccxai}"
-GROK_BIN="${GROK_BIN:-$(command -v grok 2>/dev/null || echo "$HOME/.grok/bin/grok")}"
+if [[ -z "${CCX_HOME:-}" ]]; then
+  [[ -n "${HOME:-}" ]] || { echo "ccx: neither CCX_HOME nor HOME is set" >&2; exit 2; }
+  CCX_HOME="$HOME/.ccxai"
+fi
+# An explicitly-empty GROK_BIN used to fall through to the real grok on PATH --
+# the opposite of what a caller blanking it intends.
+if [[ -n "${GROK_BIN+set}" && -z "${GROK_BIN:-}" ]]; then
+  echo "ccx: GROK_BIN is set but empty" >&2; exit 2
+fi
+GROK_BIN="${GROK_BIN:-$(command -v grok 2>/dev/null || echo "${HOME:-}/.grok/bin/grok")}"
 
 MODEL="${CCX_MODEL:-grok-4.6}"
 EFFORT="${CCX_EFFORT:-xhigh}"
@@ -31,6 +39,8 @@ _md5() { if have md5sum; then md5sum | cut -d' ' -f1; else md5 -q; fi; }
 # finishes and bills. Repair those records from whatever the worker actually left on disk.
 _reconcile() {
   local d m age budget src c now
+  mkdir "$CCX_HOME/.reconcile.lock" 2>/dev/null || return 0   # another pass is running
+  trap 'rmdir "$CCX_HOME/.reconcile.lock" 2>/dev/null || true' RETURN
   [[ -d "$CCX_HOME/runs" ]] || return 0
   now=$(date +%s)
   for d in "$CCX_HOME"/runs/*/; do
@@ -44,25 +54,45 @@ _reconcile() {
     for c in raw.json raw2.json raw1.json; do
       [[ -s "$d$c" ]] && jq -e . >/dev/null 2>&1 <"$d$c" && { src="$d$c"; break; }
     done
+    local tmp="$m.tmp.$$"
     if [[ -n "$src" ]]; then
-      jq -s --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
-        .[0] + {ts:$ts, status:"recovered",
+      jq -s --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '.[0] + {ts:$ts, status:"recovered",
                 cost:(.[1].total_cost_usd // 0), turns:(.[1].num_turns // 0),
                 stop_reason:(.[1].stopReason // "?"), seconds:0,
                 phase1_seconds:0, phase2_seconds:0, brief_bytes:0, exit_code:0,
                 grok:(.[0].grok // "?"), label:(.[0].label // "recovered"),
-                sub:"run", warnings:["reconciled: dispatcher died, worker result recovered"],
-                cmd:[]}' "$m" "$src" > "$m.tmp" && mv "$m.tmp" "$m"
-      jq -c '{ts,run,label,sub,status,profile,effort,cost,turns,seconds,phase1_seconds,
-              phase2_seconds,brief_bytes,exit_code,warnings,grok,cwd}' "$m" \
-        >> "$CCX_HOME/runs.jsonl" 2>/dev/null || true
+                sub:(.[0].sub // "run"),
+                warnings:["reconciled: dispatcher died, worker result recovered"],
+                cmd:[]}' "$m" "$src" > "$tmp" 2>/dev/null \
+        && jq -e '.status=="recovered"' "$tmp" >/dev/null 2>&1 \
+        && mv "$tmp" "$m" \
+        && _log_run "$m"
+      # If the merge failed, meta.json keeps status="running" -- appending anyway
+      # re-logged the same broken run on every ls/stats/log call, forever.
+      rm -f "$tmp"
     else
-      jq '.status="abandoned" | .warnings=["dispatcher died with no worker result"]' \
-        "$m" > "$m.tmp" && mv "$m.tmp" "$m"
+      jq '.status="abandoned" | .cost=(.cost // 0) | .turns=(.turns // 0)
+          | .seconds=(.seconds // 0)
+          | .warnings=["dispatcher died with no worker result"]' \
+        "$m" > "$tmp" 2>/dev/null && mv "$tmp" "$m" && _log_run "$m"
+      rm -f "$tmp"
     fi
   done
 }
 _mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
+# Append a completed record exactly once. Abandoned runs are logged too -- they
+# burned cost and were previously invisible to stats and export forever.
+_log_run() {
+  local m="$1"
+  grep -qs "\"$(jq -r '.run' "$m" 2>/dev/null)\"" "$CCX_HOME/runs.jsonl" 2>/dev/null && return 0
+  jq -c '{ts:(.ts // "1970-01-01T00:00:00Z"),run,label:(.label // "recovered"),
+          sub:(.sub // "run"),status,profile,effort,cost,turns,seconds,
+          phase1_seconds:(.phase1_seconds // 0),phase2_seconds:(.phase2_seconds // 0),
+          brief_bytes:(.brief_bytes // 0),exit_code:(.exit_code // 0),
+          warnings:(.warnings // []),grok:(.grok // "?"),cwd}' "$m" \
+    >> "$CCX_HOME/runs.jsonl" 2>/dev/null || true
+}
 
 usage() {
 cat <<'EOF'
@@ -101,7 +131,8 @@ OPTIONS
   --effort LEVEL    low|medium|high|xhigh   (default xhigh)
   --max-turns N     default 30 (read) / 60 (write)
   --timeout SEC     default 1800
-  --tools LIST      override the built-in tool allowlist
+  --tools LIST      restrict the worker to these grok tool IDs (ccx sets no
+                    default list; without this the worker gets grok's own)
   --allow RULE      extra permission allow rule (repeatable)
   --deny RULE       extra permission deny rule (repeatable)
   --web             permit web_search / web_fetch (off by default)
@@ -193,6 +224,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---------- subcommands that don't dispatch ----------
+case "$LSN" in ''|*[!0-9]*) die "-n must be a positive integer (got: $LSN)" ;; esac
+[[ -z "$DAYS" ]] || case "$DAYS" in *[!0-9]*) die "--days must be a positive integer (got: $DAYS)" ;; esac
+
 if [[ "$SUB" == "doctor" ]]; then
   echo "ccx $VERSION"
   printf '%-14s %s\n' "grok:" "$([[ -x "$GROK_BIN" ]] && "$GROK_BIN" --version 2>/dev/null || echo 'MISSING')"
@@ -214,7 +248,8 @@ if [[ "$SUB" == "ls" ]]; then
   ls -1t "$CCX_HOME/runs" 2>/dev/null | head -"$LSN" | while IFS= read -r d; do
     m="$CCX_HOME/runs/$d/meta.json"
     if [[ -f "$m" ]]; then
-      jq -r --arg d "$d" '"\($d)  \(.status // "?")  turns=\(.turns // "?")  $\(.cost // 0)  \(.session // "-")"' "$m"
+      jq -r --arg d "$d" '"\($d)  \(.status // "?")  turns=\(.turns // "?")  $\(.cost // 0)  \(.session // "-")"' \
+        "$m" 2>/dev/null || echo "$d  (unreadable)"
     else echo "$d  (incomplete)"; fi
   done
   exit 0
@@ -386,7 +421,10 @@ fi
 if [[ "$SUB" == "show" ]]; then
   RUN="${BRIEF#"${BRIEF%%[![:space:]]*}"}"; RUN="${RUN%"${RUN##*[![:space:]]}"}"
   [[ -n "$RUN" ]] || die "usage: ccx show <run-id>"
-  case "$RUN" in *[[:space:]]*) die "run id must be a single token (got: $RUN)" ;; esac
+  # A run id indexes a directory under $CCX_HOME/runs -- anything outside that
+  # alphabet let ".." walk out of the runs tree and print arbitrary files.
+  case "$RUN" in *[!A-Za-z0-9._-]*|*..*|"")
+    die "run id must match [A-Za-z0-9._-]+ (got: $RUN)" ;; esac
   D="$CCX_HOME/runs/$RUN"; [[ -d "$D" ]] || die "no such run: $RUN"
   case "$SHOW_WHAT" in
     transcript)
@@ -417,6 +455,13 @@ fi
 [[ "$SUB" == "cont" && -z "$SESSION" ]] && die "ccx cont requires --session <uuid>"
 [[ "$SUB" == "run"  && -n "$SESSION" ]] && die "--session resumes an existing worker; use: ccx cont --session $SESSION"
 
+# `timeout 0` means "no timeout" in coreutils, and a negative value is parsed as a
+# flag -- both surfaced as confusing downstream errors attributed to the worker.
+case "$TIMEOUT" in ''|*[!0-9]*) die "--timeout must be a positive integer (got: $TIMEOUT)" ;; esac
+(( TIMEOUT > 0 )) || die "--timeout must be greater than 0 (0 disables the timeout entirely)"
+case "$MAX_TURNS" in ''|*[!0-9]*) [[ -z "$MAX_TURNS" ]] || die "--max-turns must be a positive integer (got: $MAX_TURNS)" ;; esac
+
+
 # A worktree exists to contain writes; asking for read as well is a contradiction, and
 # silently resolving it either way produced a worker with the wrong powers.
 if [[ -n "$WORKTREE" ]]; then
@@ -442,7 +487,7 @@ if [[ -n "$TASK_FILE" ]]; then
   if [[ "$TASK_FILE" == "-" ]]; then BRIEF="$(cat)"; else
     [[ -f "$TASK_FILE" ]] || die "no such task file: $TASK_FILE"; BRIEF="$(cat "$TASK_FILE")"; fi
 fi
-[[ -n "${BRIEF// /}" ]] || die "empty brief (use --task FILE, '-' for stdin, or -- <text>)"
+[[ -n "${BRIEF//[[:space:]]/}" ]] || die "empty brief (use --task FILE, '-' for stdin, or -- <text>)"
 
 # --check is implemented in the brief, not as a CLI flag: grok removed --check in 1.0.x.
 if [[ "$CHECK" -eq 1 ]]; then
@@ -548,15 +593,18 @@ fi
 # ---------- run dir ----------
 slug="$(printf '%s' "${LABEL:-$SUB}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//;s/-*$//' | cut -c1-32)"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-${slug:-task}-$$"
-D="$CCX_HOME/runs/$RUN_ID"; mkdir -p "$D"
+D="$CCX_HOME/runs/$RUN_ID"
+mkdir -p "$D" 2>/dev/null || die "cannot create run directory under CCX_HOME ($CCX_HOME) -- not writable?"
 printf '%s\n' "$BRIEF" > "$D/brief.md"
 # Record the session BEFORE dispatching. ccx's own timeout path is not the only way a
 # run dies -- an external SIGTERM (harness limit, ctrl-c, sleep) kills us before we can
 # report anything, and the worker's context is only recoverable if the id was written down.
 jq -n --arg r "$RUN_ID" --arg s "$PRESET_SID" --arg cwd "$CWD" --arg p "$PROFILE" \
-      --arg m "$MODEL" --arg ef "$EFFORT" --arg to "$TIMEOUT" \
+      --arg m "$MODEL" --arg ef "$EFFORT" --arg to "$TIMEOUT" --arg mt "$MAX_TURNS" \
+      --arg lb "${LABEL:-$SUB}" --arg sb "$SUB" \
   '{run:$r,session:$s,cwd:$cwd,profile:$p,model:$m,effort:$ef,
-    timeout_s:($to|tonumber),status:"running"}' > "$D/meta.json"
+    timeout_s:($to|tonumber),max_turns:($mt|tonumber),label:$lb,sub:$sb,
+    status:"running"}' > "$D/meta.json"
 
 # ---------- observability: capture the exact invocation ----------
 # The single most useful debugging artifact is what was ACTUALLY passed to grok.
@@ -646,12 +694,13 @@ jq -n --arg r "$RUN_ID" --arg s "$SID" --arg st "$STATUS" --arg c "$COST" \
       --arg t "$TURNS" --arg e "$ELAPSED" --arg cwd "$CWD" --arg m "$MODEL" --arg ef "$EFFORT" \
       --arg gv "$GROK_VER" --arg p "$PROFILE" --arg lb "${LABEL:-$SUB}" --arg sub "$SUB" \
       --arg p1 "$P1_SECONDS" --arg p2 "$P2_SECONDS" --arg rc "$RC" --arg stop "$STOP" \
+      --arg mt "$MAX_TURNS" \
       --argjson cmd "$CMD_JSON" --argjson warn "$WARN_JSON" \
       --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg bb "$(wc -c < "$D/brief.md" | tr -d ' ')" \
   '{ts:$ts,run:$r,session:$s,sub:$sub,label:$lb,status:$st,stop_reason:$stop,
     cost:($c|tonumber),turns:($t|tonumber),seconds:($e|tonumber),
     phase1_seconds:($p1|tonumber),phase2_seconds:($p2|tonumber),
-    brief_bytes:($bb|tonumber),exit_code:($rc|tonumber),
+    brief_bytes:($bb|tonumber),exit_code:($rc|tonumber),max_turns:($mt|tonumber),
     cwd:$cwd,model:$m,effort:$ef,profile:$p,grok:$gv,warnings:$warn,cmd:$cmd}' > "$D/meta.json"
 # Append-only event log: one compact line per run, so `jq -s` over a single file
 # answers "what did this cost / what keeps failing" without globbing run dirs.
@@ -666,6 +715,11 @@ if [[ "$RAW" -eq 0 ]]; then
   printf 'full transcript: ccx show %s --transcript\n' "$RUN_ID"
   [[ -n "$SID" ]] && printf 'continue:        ccx cont --session %s -- "<followup>"\n' "$SID"
   printf -- '---\n'
+fi
+
+if [[ ! -s "$D/envelope.json" ]] || [[ -z "$(tr -d '[:space:]' < "$D/envelope.json")" ]]; then
+  echo "ccx: worker returned no usable result (empty envelope). See: ccx show $RUN_ID --transcript" >&2
+  exit 5
 fi
 
 SZ=$(wc -c < "$D/envelope.json" | tr -d ' ')

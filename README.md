@@ -93,10 +93,12 @@ ccx log -n 20             # raw JSONL, pipe to jq
 ccx show <run> --transcript
 ```
 
-`meta.json` records the **exact argv passed to grok** — the single most useful debugging
-artifact, and the one thing you cannot reconstruct after the fact. Also: phase-1 vs phase-2
-timing split, brief size, exit code, grok version, and a `warnings[]` array that flags a
-suspected short-circuit (≤1 turn in <20s) or a blocked worker.
+`meta.json` records the **containment argv passed to grok** — sandbox, permission mode,
+allow/deny rules, tool filter, session id — which is the part you cannot reconstruct
+afterwards. The prompt, cwd, model, effort, max-turns and output format are recorded as
+their own fields rather than inside `cmd`. Also: phase-1 vs phase-2 timing split, brief
+size, exit code, grok version, and a `warnings[]` array that flags a suspected
+short-circuit (≤1 turn in <20s) or a blocked worker.
 
 ### OpenTelemetry (optional)
 

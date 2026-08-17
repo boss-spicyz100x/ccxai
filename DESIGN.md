@@ -153,10 +153,14 @@ Budget real Opus effort here — the brief *is* the interface.
 
 ### 4c. Dispatcher (implemented: `plugins/ccx/bin/ccx`)
 
+> The grok invocations below are the original single-phase sketch. The shipped
+> dispatcher is two-phase and carries a larger deny list — read `plugins/ccx/bin/ccx`
+> for current behaviour, not this section.
+
 ```bash
 ccx run  --task brief.md [--write] [--cwd DIR] [--worktree NAME] [--timeout 900]
 ccx cont --session <uuid> --task followup.md     # correction round, keeps worker context
-ccx show --run <id>                              # full transcript on demand
+ccx show <run-id> --transcript                   # full transcript on demand
 ```
 
 Read profile — kernel makes it read-only, so permissions can be fully permissive:
@@ -269,6 +273,10 @@ as an operational hazard when iterating on a script that is currently dispatchin
 - `--tools`, `--disallowed-tools`, `--max-turns` are headless-only; ignored with a warning in the TUI.
 - Resuming replays history — later rounds get more expensive. Cap correction rounds at ~2, then re-brief fresh.
 - The bundled `~/.grok/README.md` (Jul 9) is older than the binary (Aug 17). `grok --help` wins.
+- A test that counts flag *names* is not coverage. `tests/phase-parity.sh` originally
+  compared how many `--deny` flags each phase carried; it passed a regression that swapped
+  every deny rule for a no-op pattern of the same count, and another that dropped `--tools`
+  from phase 2 entirely. It compares full `(flag, value)` sets now.
 - `git rev-parse --git-common-dir` returns a **relative** `.git` from a main checkout and
   an absolute path from a worktree. Comparing the two with `-ef` resolves the relative one
   against the caller's cwd, so a legitimate worktree reads as foreign. Use
