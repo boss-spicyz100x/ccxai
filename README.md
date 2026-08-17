@@ -81,4 +81,29 @@ are driving interactively; it is not fine for an autonomously dispatched worker.
 `/tmp` is writable under every profile, so `ccx` refuses to start a `--read` worker whose
 cwd is on a temp path rather than let the guarantee quietly not apply.
 
+## Operating notes
+
+Learned from real use, not from the docs:
+
+- **Start long reviews in the background.** A 2708-line subsystem review runs past ten
+  minutes while working perfectly normally. Foreground limits will kill it.
+- **A fresh worktree has no dependencies.** `git worktree add` gives you a clean checkout
+  with no `node_modules`, so the acceptance command cannot run in it. Install deps and
+  confirm the suite is green *before* delegating — otherwise you cannot tell the worker's
+  breakage from a broken baseline.
+- **Never edit `ccx` while a run is in flight.** Bash reads scripts lazily by byte offset;
+  the running process will resume into rewritten content and corrupt that run.
+- **Pin the CLI if you want stability.** `grok` auto-updates and has dropped flags across
+  a major (`--check`, `--best-of-n` went away in 1.0). `ccx` asserts what it needs and
+  records the version per run, but `auto_update = false` in `~/.grok/config.toml` is the
+  real fix.
+
+## Status
+
+| Path | Evidence |
+|---|---|
+| `--read` review | **Proven.** Found 6 real defects in a 2708-line production subsystem; all 6 verified against source. Under $0.30. |
+| `--write` in a worktree | **Works, lightly used.** Isolation verified (writes confined, main checkout clean, `cont` resumes in the worktree). Read every diff. |
+| `grok-worker` agent | **Untested.** Ships, never run. |
+
 See `DESIGN.md` for the full rationale, prior art, and measurements.

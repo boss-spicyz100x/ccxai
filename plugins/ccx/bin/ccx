@@ -244,8 +244,12 @@ if [[ -n "$WORKTREE" ]]; then
     # write target, defeating the isolation the flag promises.
     git -C "$WT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
       || die "$WT exists but is not a git worktree; remove it or pick another name"
-    [[ "$(git -C "$WT" rev-parse --git-common-dir 2>/dev/null)" \
-       -ef "$(git -C "$REPO" rev-parse --git-common-dir 2>/dev/null)" ]] \
+    # --path-format=absolute is required: plain --git-common-dir returns a RELATIVE
+    # ".git" from the main checkout, which -ef then resolves against the caller's cwd
+    # rather than the repo, rejecting every legitimate worktree reuse.
+    wt_common="$(git -C "$WT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+    repo_common="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+    [[ -n "$wt_common" && "$wt_common" -ef "$repo_common" ]] \
       || die "$WT is a worktree of a different repository"
   else
     mkdir -p "$(dirname "$WT")"
