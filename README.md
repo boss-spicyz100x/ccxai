@@ -34,12 +34,27 @@ ccx doctor
 ## Use
 
 ```bash
+ccx fanout --briefs briefs/ --read                     # N briefs, N workers, in parallel
 ccx run --read --label review --task brief.md          # read-only worker
 ccx run --worktree fix-auth --task brief.md --check    # writes, confined to a worktree
 ccx cont --session <uuid> -- "test_x still fails: ..." # correction round
 ccx show <run-id> --transcript                         # full reasoning, on demand
 ccx ls
 ```
+
+### Fan-out
+
+`ccx fanout --briefs <dir>` runs every `*.md` / `*.txt` brief in a directory as its own
+worker, in parallel. It is an orchestrator over `ccx run`, so every guard rail, profile,
+and containment rule is exactly the same as a single dispatch.
+
+Slugs come from the brief filenames (sanitised, de-duplicated). A **write** fan-out gives
+each worker its own git worktree — that is what makes concurrent writers safe. A **read**
+fan-out skips worktrees entirely, since a read worker cannot write anything. `--concurrency N`
+caps how many run at once (default 4).
+
+It exits non-zero if any worker fails, and prints a per-brief table of status, turns, cost
+and duration. Measured: 3 read workers, $0.07, 56s wall against 79s serial.
 
 In Claude Code: `/ccx:review`, `/ccx:implement`, `/ccx:cont`, or the `grok-worker`
 subagent for parallel fan-out. The `grok-delegation` skill teaches Claude when to

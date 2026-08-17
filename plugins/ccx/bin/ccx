@@ -102,6 +102,8 @@ USAGE
   ccx run     [opts] (--task FILE | -- <brief text>)   dispatch a fresh worker
   ccx cont    --session <uuid> [opts] (--task FILE | -- <text>)
                                                        continue an existing worker
+  ccx fanout  --briefs DIR [opts]                      run every brief in DIR in
+                                                       parallel, one worker each
   ccx show    <run-id> [--transcript|--envelope|--meta] inspect a past run
   ccx ls      [-n N]                                   list recent runs
   ccx stats   [--days N] [--label L]                   aggregate spend, timing, failures
@@ -139,6 +141,8 @@ OPTIONS
   --mcp             permit MCP tools (off by default: MCP servers run OUTSIDE
                     the sandbox, so they can write to remote systems)
   --label TEXT      label for the run directory
+  --briefs DIR      fanout only: directory of *.md / *.txt briefs, one per worker
+  --concurrency N   fanout only: max workers in flight at once (default 4)
   --raw             print only the envelope JSON (no header)
   --check           require the worker to verify its own work before returning
 
@@ -183,6 +187,7 @@ PROFILE=read; PROFILE_SET=0; CWD_SET=0; MCP=0
 TASK_FILE=""; BRIEF=""; CWD="$PWD"; WORKTREE=""; REF="HEAD"
 SCHEMA_FILE=""; USE_SCHEMA=1; MAX_TURNS=""; TOOLS=""; WEB=0; LABEL=""
 RAW=0; CHECK=0; SESSION=""; SHOW_WHAT="envelope"; LSN=15; SCHEMA_INLINE=0
+BRIEFS=""; CONCURRENCY=4
 DAYS=""; LABELF=""; EXPORT_ALL=0
 declare -a XALLOW=() XDENY=()
 
@@ -207,6 +212,8 @@ while [[ $# -gt 0 ]]; do
     --web)        WEB=1; shift ;;
     --mcp)        MCP=1; shift ;;
     --label)      LABEL="${2:?}"; shift 2 ;;
+    --briefs)     BRIEFS="${2:?}"; shift 2 ;;
+    --concurrency) CONCURRENCY="${2:?}"; shift 2 ;;
     --raw)        RAW=1; shift ;;
     --check)      CHECK=1; shift ;;
     --session)    SESSION="${2:?}"; shift 2 ;;
@@ -416,6 +423,97 @@ if [[ "$SUB" == "export" ]]; then
     head -c 300 "$RESP" >&2; echo >&2; exit 1
   fi
   exit 0
+fi
+
+if [[ "$SUB" == "fanout" ]]; then
+  # An orchestrator over `ccx run`, not a second dispatch path: every guard rail,
+  # profile and containment rule is whatever `ccx run` already applies.
+  [[ -n "$BRIEFS" ]] || die "ccx fanout requires --briefs <dir>"
+  [[ -d "$BRIEFS" ]] || die "no such briefs directory: $BRIEFS"
+  case "$CONCURRENCY" in ''|*[!0-9]*) die "--concurrency must be a positive integer (got: $CONCURRENCY)" ;; esac
+  (( CONCURRENCY > 0 )) || die "--concurrency must be greater than 0"
+
+  declare -a FILES=()
+  while IFS= read -r f; do FILES+=("$f"); done < <(
+    find "$BRIEFS" -maxdepth 1 -type f \( -name '*.md' -o -name '*.txt' \) | sort)
+  (( ${#FILES[@]} )) || die "no .md or .txt briefs found in $BRIEFS"
+
+  STAMP="$(date +%Y%m%d-%H%M%S)"
+  OUT="$CCX_HOME/fanout/$STAMP"
+  mkdir -p "$OUT" || die "cannot create $OUT -- CCX_HOME not writable?"
+
+  # Forward the flags that shape each worker. Deliberately NOT --worktree or
+  # --label: fanout derives one of each per brief.
+  declare -a FWD=(--cwd "$CWD" --model "$MODEL" --effort "$EFFORT" --timeout "$TIMEOUT")
+  [[ "$PROFILE_SET" -eq 1 && "$PROFILE" == "read" ]] && FWD+=(--read)
+  [[ -n "$MAX_TURNS" ]] && FWD+=(--max-turns "$MAX_TURNS")
+  [[ -n "$SCHEMA_FILE" ]] && FWD+=(--schema "$SCHEMA_FILE")
+  [[ "$USE_SCHEMA" -eq 0 ]] && FWD+=(--no-schema)
+  [[ "$SCHEMA_INLINE" -eq 1 ]] && FWD+=(--schema-inline)
+  [[ -n "$TOOLS" ]] && FWD+=(--tools "$TOOLS")
+  [[ "$WEB" -eq 1 ]] && FWD+=(--web)
+  [[ "$MCP" -eq 1 ]] && FWD+=(--mcp)
+  [[ "$CHECK" -eq 1 ]] && FWD+=(--check)
+  for r in ${XALLOW+"${XALLOW[@]}"}; do FWD+=(--allow "$r"); done
+  for r in ${XDENY+"${XDENY[@]}"};  do FWD+=(--deny  "$r"); done
+
+  printf 'fanout %s | %s brief(s) | %s profile | up to %s at once\n' \
+    "$STAMP" "${#FILES[@]}" "$PROFILE" "$CONCURRENCY"
+  printf 'results: %s\n\n' "$OUT"
+
+  declare -a SLUGS=()
+  for f in "${FILES[@]}"; do
+    base="$(basename "$f")"; base="${base%.*}"
+    slug="$(printf '%s' "$base" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^-*//;s/-*$//' | cut -c1-32)"
+    [[ -n "$slug" ]] || slug="brief$(( ${#SLUGS[@]} + 1 ))"
+    # worktree names must be unique; a collision would put two writers in one tree
+    n=1; try="$slug"
+    while printf '%s\n' ${SLUGS+"${SLUGS[@]}"} | grep -qx "$try"; do n=$((n+1)); try="$slug-$n"; done
+    slug="$try"; SLUGS+=("$slug")
+
+    # a write worker gets its own worktree; a read worker cannot write, so it shares cwd
+    declare -a ISO=()
+    [[ "$PROFILE" == "write" ]] && ISO=(--worktree "$slug")
+
+    while (( $(jobs -rp | wc -l) >= CONCURRENCY )); do sleep 1; done
+    ( set +e
+      "$0" run "${FWD[@]}" ${ISO+"${ISO[@]}"} --label "$slug" --task "$f" \
+        >"$OUT/$slug.json" 2>"$OUT/$slug.err"
+      printf '%s %s\n' "$?" "$slug" >> "$OUT/exits" ) &
+    printf '  dispatched %s\n' "$slug"
+  done
+  wait
+
+  : > "$OUT/exits.tmp"; [[ -f "$OUT/exits" ]] && cat "$OUT/exits" >> "$OUT/exits.tmp"
+  mv "$OUT/exits.tmp" "$OUT/exits"
+  echo; printf '%-24s %-9s %6s %8s %7s\n' BRIEF STATUS TURNS COST SECONDS
+  rc=0
+  for slug in "${SLUGS[@]}"; do
+    ex=$(awk -v s="$slug" '$2==s{print $1; exit}' "$OUT/exits" 2>/dev/null || true)
+    env=$(sed -n '/^---$/,$p' "$OUT/$slug.json" 2>/dev/null | tail -n +2)
+    if [[ "$USE_SCHEMA" -eq 1 ]]; then
+      st=$(jq -r '.status // "?"' <<<"$env" 2>/dev/null || echo "?")
+    else
+      # --no-schema returns prose, not an envelope: the exit code is the only verdict
+      st=$([[ "$ex" == "0" ]] && echo "ok" || echo "failed")
+    fi
+    md=$(ls -dt "$CCX_HOME"/runs/*-"$slug"-* 2>/dev/null | head -1)
+    printf '%-24s %-9s %6s %8s %7s\n' "${slug:0:24}" "$st" \
+      "$(jq -r '.turns // "-"' "$md/meta.json" 2>/dev/null)" \
+      "$(jq -r 'if .cost then "$" + (.cost*100|round/100|tostring) else "-" end' "$md/meta.json" 2>/dev/null)" \
+      "$(jq -r '.seconds // "-"' "$md/meta.json" 2>/dev/null)"
+    if [[ "$USE_SCHEMA" -eq 1 ]]; then
+      [[ "$ex" == "0" && "$st" == "done" ]] || rc=1
+    else
+      [[ "$ex" == "0" ]] || rc=1
+    fi
+  done
+  tot=$(jq -s 'map(.cost // 0)|add' $(for s in "${SLUGS[@]}"; do
+          ls -dt "$CCX_HOME"/runs/*-"$s"-*/meta.json 2>/dev/null | head -1; done) 2>/dev/null || echo 0)
+  printf '\ntotal $%s across %s worker(s)\n' "$(printf '%.2f' "${tot:-0}")" "${#SLUGS[@]}"
+  [[ "$PROFILE" == "write" ]] && echo "worktrees under $CCX_HOME/worktrees/ -- review each diff before merging"
+  (( rc == 0 )) || echo "one or more workers did not return status=done -- see $OUT/*.err" >&2
+  exit "$rc"
 fi
 
 if [[ "$SUB" == "show" ]]; then
