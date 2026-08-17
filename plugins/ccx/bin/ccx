@@ -439,11 +439,15 @@ if [[ "$PROFILE" == "read" ]]; then
 fi
 
 # ---------- profile ----------
-declare -a ARGS=()
+# SAFE holds everything that CONTAINS the worker. Both phases must carry all of it:
+# phase 2 previously rebuilt this by hand and silently dropped permission-mode, the
+# allow rule, 9 of 10 deny rules and the Agent block -- falling back to whatever
+# ~/.grok/config.toml says, which is the exact inheritance ccx exists to prevent.
+declare -a SAFE=() ARGS=()
 if [[ "$PROFILE" == "write" ]]; then
   SANDBOX=workspace
-  ARGS+=(--sandbox "$SANDBOX" --permission-mode acceptEdits --allow "Bash")
-  ARGS+=(--deny "Bash(sudo*)" --deny "Bash(rm -rf /*)" --deny "Bash(git push*)"
+  SAFE+=(--sandbox "$SANDBOX" --permission-mode acceptEdits --allow "Bash")
+  SAFE+=(--deny "Bash(sudo*)" --deny "Bash(rm -rf /*)" --deny "Bash(git push*)"
          --deny "Bash(git reset --hard*)" --deny "Bash(gh*)" --deny "Bash(npm publish*)"
          --deny "Edit(**/.env*)" --deny "Write(**/.env*)")
   : "${MAX_TURNS:=60}"
@@ -451,17 +455,20 @@ else
   # read-only is enforced by the kernel, so permissions can be permissive:
   # the worker gets the full toolset (incl. shell) and simply cannot write.
   SANDBOX=read-only
-  ARGS+=(--sandbox "$SANDBOX" --permission-mode bypassPermissions)
+  SAFE+=(--sandbox "$SANDBOX" --permission-mode bypassPermissions)
   : "${MAX_TURNS:=30}"
 fi
-[[ -n "$TOOLS" ]] && ARGS+=(--tools "$TOOLS")
-ARGS+=(--disallowed-tools "Agent")
-[[ "$WEB" -eq 0 ]] && ARGS+=(--disable-web-search)
+[[ -n "$TOOLS" ]] && SAFE+=(--tools "$TOOLS")
+SAFE+=(--disallowed-tools "Agent")
+[[ "$WEB" -eq 0 ]] && SAFE+=(--disable-web-search)
 # MCP servers are separate processes OUTSIDE the kernel sandbox, so a "read-only"
 # worker could still perform remote writes through them (e.g. signoz_delete_alert).
-[[ "$MCP" -eq 0 ]] && ARGS+=(--deny "MCPTool(*)")
-for r in ${XALLOW+"${XALLOW[@]}"}; do ARGS+=(--allow "$r"); done
-for r in ${XDENY+"${XDENY[@]}"};  do ARGS+=(--deny  "$r"); done
+[[ "$MCP" -eq 0 ]] && SAFE+=(--deny "MCPTool(*)")
+for r in ${XALLOW+"${XALLOW[@]}"}; do SAFE+=(--allow "$r"); done
+for r in ${XDENY+"${XDENY[@]}"};  do SAFE+=(--deny  "$r"); done
+
+# Session/schema flags are per-phase; containment is not.
+ARGS=(${SAFE+"${SAFE[@]}"})
 
 SCHEMA=""
 if [[ "$USE_SCHEMA" -eq 1 ]]; then
@@ -543,13 +550,11 @@ STOP=$(jq -r '.stopReason // "?"' "$D/raw.json")
 # ---------- phase 2: format the finished work into the envelope ----------
 if [[ "$USE_SCHEMA" -eq 1 && "$SCHEMA_INLINE" -eq 0 && -n "$SID" ]]; then
   mv "$D/raw.json" "$D/raw1.json"
-  declare -a P2=()
-  [[ "$MCP" -eq 0 ]] && P2+=(--deny "MCPTool(*)")
   set +e
   timeout --kill-after=15s 180 "$GROK_BIN" --no-auto-update \
     -p "Now return the result of the work you just did as JSON matching the required schema. Base it ENTIRELY on what you already found; do not investigate further and do not use any tools. If you did not actually complete the work, say so honestly with status=partial or blocked rather than returning an empty result." \
     --cwd "$CWD" -m "$MODEL" --reasoning-effort low --resume "$SID" \
-    --sandbox "$SANDBOX" --disable-web-search ${P2+"${P2[@]}"} \
+    ${SAFE+"${SAFE[@]}"} \
     --max-turns 1 --json-schema "$SCHEMA" --output-format json \
     >"$D/raw2.json" 2>>"$D/stderr.log"
   RC2=$?
