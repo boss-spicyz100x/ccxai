@@ -36,6 +36,7 @@ USAGE
   ccx show    <run-id> [--transcript|--envelope|--meta] inspect a past run
   ccx ls      [-n N]                                   list recent runs
   ccx stats   [--days N] [--label L]                   aggregate spend, timing, failures
+                                                       (--label-filter is an alias)
   ccx log     [-n N]                                   raw JSONL event log (one line/run)
   ccx export  [--all]                                  ship runs to an OTLP collector
   ccx doctor                                           check the setup
@@ -191,29 +192,41 @@ if [[ "$SUB" == "stats" ]]; then
   CUT=""
   [[ -n "$DAYS" ]] && CUT=$(date -u -v-"${DAYS}"d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
                             || date -u -d "${DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)
-  jq -s --arg cut "$CUT" --arg lab "$LABELF" '
+  LABF="${LABELF:-$LABEL}"
+  jq -s --arg cut "$CUT" --arg lab "$LABF" '
     map(select(($cut == "" or .ts >= $cut) and ($lab == "" or .label == $lab)))
     | if length == 0 then "no runs match" else
     { runs: length,
-      total_usd: (map(.cost) | add | .*10000 | round | ./10000),
-      usd_per_run: ((map(.cost) | add / length) * 10000 | round | ./10000),
-      wall_clock_min: ((map(.seconds) | add) / 60 | round),
-      by_status:  (group_by(.status) | map({(.[0].status): length}) | add),
-      by_profile: (group_by(.profile) | map({(.[0].profile): length}) | add),
-      spend_by_label: (group_by(.label) | map({(.[0].label): ((map(.cost)|add)*10000|round|./10000)})
-                       | add),
-      seconds: (map(.seconds) | sort |
+      total_usd: (map(.cost // 0) | add | .*10000 | round | ./10000),
+      usd_per_run: ((map(.cost // 0) | add / length) * 10000 | round | ./10000),
+      wall_clock_min: ((map(.seconds // 0) | add) / 60 | round),
+      by_status:  (group_by(.status // "unknown")
+                   | map({(.[0].status // "unknown"): length}) | add),
+      by_profile: (group_by(.profile // "unknown")
+                   | map({(.[0].profile // "unknown"): length}) | add),
+      spend_by_label: (group_by(.label // "unknown")
+                       | map({(.[0].label // "unknown"):
+                              ((map(.cost // 0)|add)*10000|round|./10000)}) | add),
+      seconds: (map(.seconds // 0) | sort |
                 {p50: .[(length/2|floor)], p90: .[(length*0.9|floor)], max: .[length-1]}),
-      phase2_overhead_pct: ((map(.phase2_seconds) | add) as $p2
-                            | (map(.seconds) | add) as $t
+      phase2_overhead_pct: ((map(.phase2_seconds // 0) | add) as $p2
+                            | (map(.seconds // 0) | add) as $t
                             | if $t > 0 then ($p2 / $t * 1000 | round / 10) else 0 end),
-      runs_with_warnings: (map(select(.warnings | length > 0)) | length),
-      warnings: (map(.warnings[]) | group_by(.) | map({(.[0]|split(":")[0]): length}) | add) }
+      incomplete_records: (map(select(
+                             (has("status")|not) or (has("cost")|not) or
+                             (has("label")|not) or (has("warnings")|not))) | length),
+      runs_with_warnings: (map(select((.warnings // []) | length > 0)) | length),
+      warnings: (map((.warnings // [])[]) | group_by(.)
+                 | map({(.[0]|split(":")[0]): length}) | add) }
     end' "$L"
   { echo
     echo "recent failures / warnings:"
-    jq -r 'select((.status|test("blocked|timeout|killed")) or (.warnings|length>0))
-           | "  \(.ts)  \(.run)  \(.status)  \(.warnings|join("; "))"' "$L" | tail -8
+    jq -r --arg cut "$CUT" --arg lab "$LABF" '
+      select(($cut == "" or .ts >= $cut) and ($lab == "" or (.label // "") == $lab))
+      | select((((.status // "") | test("blocked|timeout|killed")))
+               or (((.warnings // []) | length) > 0))
+      | "  \(.ts)  \(.run)  \(.status // "?")  \((.warnings // []) | join("; "))"' \
+      "$L" | tail -8
   } >&2
   exit 0
 fi
