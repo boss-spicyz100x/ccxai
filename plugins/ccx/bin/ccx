@@ -318,6 +318,12 @@ slug="$(printf '%s' "${LABEL:-$SUB}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0
 RUN_ID="$(date +%Y%m%d-%H%M%S)-${slug:-task}-$$"
 D="$CCX_HOME/runs/$RUN_ID"; mkdir -p "$D"
 printf '%s\n' "$BRIEF" > "$D/brief.md"
+# Record the session BEFORE dispatching. ccx's own timeout path is not the only way a
+# run dies -- an external SIGTERM (harness limit, ctrl-c, sleep) kills us before we can
+# report anything, and the worker's context is only recoverable if the id was written down.
+jq -n --arg r "$RUN_ID" --arg s "$PRESET_SID" --arg cwd "$CWD" --arg p "$PROFILE" \
+      --arg m "$MODEL" --arg ef "$EFFORT" \
+  '{run:$r,session:$s,cwd:$cwd,profile:$p,model:$m,effort:$ef,status:"running"}' > "$D/meta.json"
 
 # ---------- dispatch ----------
 START=$(date +%s)

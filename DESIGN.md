@@ -270,6 +270,12 @@ as an operational hazard when iterating on a script that is currently dispatchin
 - Resuming replays history — later rounds get more expensive. Cap correction rounds at ~2, then re-brief fresh.
 - The bundled `~/.grok/README.md` (Jul 9) is older than the binary (Aug 17). `grok --help` wins.
 - Editing the dispatcher while it is running corrupts that run: bash reads scripts lazily.
+- A run can die in two different ways and only one of them is yours. `ccx`'s own
+  `timeout` fires and can report; an **external** SIGTERM (harness limit, ctrl-c, sleep)
+  kills the dispatcher before it reports anything. Recording the session id only on the
+  self-timeout path still loses the work. Write it to `meta.json` *before* dispatching.
+- Long reviews must be started in the background. A real 2708-line subsystem review
+  exceeded a 10-minute foreground limit while still working normally.
 - `grep -c` with zero matches prints `0` *and* exits 1, so `$(grep -c … || echo 0)` yields
   a two-line `0\n0` that breaks numeric comparison.
 
