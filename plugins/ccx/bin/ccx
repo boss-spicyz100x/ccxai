@@ -10,6 +10,7 @@
 #   3. Safety is pinned per-invocation via the kernel sandbox, never inherited
 #      from ~/.grok/config.toml (which may be yolo/always-approve).
 set -euo pipefail
+unset CDPATH  # else `cd "$x" && pwd` echoes the resolved path too, doubling CWD
 
 VERSION="0.1.0"
 CCX_HOME="${CCX_HOME:-$HOME/.ccxai}"
@@ -24,6 +25,44 @@ die() { printf 'ccx: %s\n' "$*" >&2; exit 2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 # md5 of stdin as lowercase hex; GNU coreutils and BSD spell it differently.
 _md5() { if have md5sum; then md5sum | cut -d' ' -f1; else md5 -q; fi; }
+
+# ccx can be SIGKILLed (harness limit, ctrl-c, sleep) -- untrappable, so the post-dispatch
+# write never happens and meta.json stays "running" forever while the detached worker often
+# finishes and bills. Repair those records from whatever the worker actually left on disk.
+_reconcile() {
+  local d m age budget src c now
+  [[ -d "$CCX_HOME/runs" ]] || return 0
+  now=$(date +%s)
+  for d in "$CCX_HOME"/runs/*/; do
+    m="$d/meta.json"; [[ -f "$m" ]] || continue
+    [[ "$(jq -r '.status // ""' "$m" 2>/dev/null)" == "running" ]] || continue
+    # never touch a run that could still legitimately be in flight
+    budget=$(jq -r '.timeout_s // 1800' "$m" 2>/dev/null)
+    age=$(( now - $(_mtime "$m") ))
+    (( age > budget + 600 )) || continue
+    src=""
+    for c in raw.json raw2.json raw1.json; do
+      [[ -s "$d$c" ]] && jq -e . >/dev/null 2>&1 <"$d$c" && { src="$d$c"; break; }
+    done
+    if [[ -n "$src" ]]; then
+      jq -s --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+        .[0] + {ts:$ts, status:"recovered",
+                cost:(.[1].total_cost_usd // 0), turns:(.[1].num_turns // 0),
+                stop_reason:(.[1].stopReason // "?"), seconds:0,
+                phase1_seconds:0, phase2_seconds:0, brief_bytes:0, exit_code:0,
+                grok:(.[0].grok // "?"), label:(.[0].label // "recovered"),
+                sub:"run", warnings:["reconciled: dispatcher died, worker result recovered"],
+                cmd:[]}' "$m" "$src" > "$m.tmp" && mv "$m.tmp" "$m"
+      jq -c '{ts,run,label,sub,status,profile,effort,cost,turns,seconds,phase1_seconds,
+              phase2_seconds,brief_bytes,exit_code,warnings,grok,cwd}' "$m" \
+        >> "$CCX_HOME/runs.jsonl" 2>/dev/null || true
+    else
+      jq '.status="abandoned" | .warnings=["dispatcher died with no worker result"]' \
+        "$m" > "$m.tmp" && mv "$m.tmp" "$m"
+    fi
+  done
+}
+_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
 
 usage() {
 cat <<'EOF'
@@ -170,8 +209,9 @@ if [[ "$SUB" == "doctor" ]]; then
 fi
 
 if [[ "$SUB" == "ls" ]]; then
+  _reconcile
   [[ -d "$CCX_HOME/runs" ]] || { echo "no runs yet"; exit 0; }
-  for d in $(ls -1t "$CCX_HOME/runs" 2>/dev/null | head -"$LSN"); do
+  ls -1t "$CCX_HOME/runs" 2>/dev/null | head -"$LSN" | while IFS= read -r d; do
     m="$CCX_HOME/runs/$d/meta.json"
     if [[ -f "$m" ]]; then
       jq -r --arg d "$d" '"\($d)  \(.status // "?")  turns=\(.turns // "?")  $\(.cost // 0)  \(.session // "-")"' "$m"
@@ -181,12 +221,14 @@ if [[ "$SUB" == "ls" ]]; then
 fi
 
 if [[ "$SUB" == "log" ]]; then
+  _reconcile
   [[ -f "$CCX_HOME/runs.jsonl" ]] || { echo "no runs logged yet"; exit 0; }
   tail -"$LSN" "$CCX_HOME/runs.jsonl"
   exit 0
 fi
 
 if [[ "$SUB" == "stats" ]]; then
+  _reconcile
   L="$CCX_HOME/runs.jsonl"
   [[ -f "$L" ]] || { echo "no runs logged yet (runs before instrumentation are not included)"; exit 0; }
   CUT=""
@@ -320,8 +362,11 @@ if [[ "$SUB" == "export" ]]; then
     done
   fi
 
-  : > /tmp/ccx-otlp.out   # never echo the previous attempt's body on a connect failure
-  CODE=$(printf '%s' "$BODY" | curl -sS -o /tmp/ccx-otlp.out -w '%{http_code}' \
+  # A fixed path in shared /tmp is both a symlink-truncation target and a collision
+  # between concurrent exports under different CCX_HOME values (the lock is per-home).
+  RESP=$(mktemp "${TMPDIR:-/tmp}/ccx-otlp.XXXXXX")
+  trap 'rmdir "$LOCK" 2>/dev/null || true; rm -f "$RESP" 2>/dev/null || true' EXIT
+  CODE=$(printf '%s' "$BODY" | curl -sS -o "$RESP" -w '%{http_code}' \
     -X POST "${EP%/}/v1/traces" -H 'Content-Type: application/json' \
     ${HDRS+"${HDRS[@]}"} --data-binary @- 2>/dev/null) || CODE=000
   if [[ "$CODE" =~ ^2 ]]; then
@@ -333,13 +378,15 @@ if [[ "$SUB" == "export" ]]; then
     echo "exported $N span(s) to ${EP%/}/v1/traces (HTTP $CODE); cursor -> $NEWLAST"
   else
     echo "export failed (HTTP $CODE) -- local log intact, retry later" >&2
-    head -c 300 /tmp/ccx-otlp.out >&2; echo >&2; exit 1
+    head -c 300 "$RESP" >&2; echo >&2; exit 1
   fi
   exit 0
 fi
 
 if [[ "$SUB" == "show" ]]; then
-  RUN="${BRIEF// /}"; [[ -n "$RUN" ]] || die "usage: ccx show <run-id>"
+  RUN="${BRIEF#"${BRIEF%%[![:space:]]*}"}"; RUN="${RUN%"${RUN##*[![:space:]]}"}"
+  [[ -n "$RUN" ]] || die "usage: ccx show <run-id>"
+  case "$RUN" in *[[:space:]]*) die "run id must be a single token (got: $RUN)" ;; esac
   D="$CCX_HOME/runs/$RUN"; [[ -d "$D" ]] || die "no such run: $RUN"
   case "$SHOW_WHAT" in
     transcript)
@@ -350,7 +397,12 @@ if [[ "$SUB" == "show" ]]; then
       echo "      the full tool loop lives in ~/.grok/sessions/, keyed by cwd and session id."
       jq -r '"      session: " + (.session // "-")' "$D/meta.json" 2>/dev/null ;;
     meta)       cat "$D/meta.json" ;;
-    *)          cat "$D/envelope.json" 2>/dev/null || jq -r '.text' "$D/raw.json" ;;
+    *)  # a kill between phases leaves raw.json absent while raw2 holds the envelope
+        cat "$D/envelope.json" 2>/dev/null \
+          || jq -e '.structuredOutput' "$D/raw2.json" 2>/dev/null \
+          || jq -r '.text' "$D/raw.json" 2>/dev/null \
+          || jq -r '.text' "$D/raw1.json" 2>/dev/null \
+          || die "run $RUN has no readable result" ;;
   esac
   exit 0
 fi
@@ -363,13 +415,14 @@ if [[ "$USE_SCHEMA" -eq 1 ]] && ! "$GROK_BIN" --help 2>&1 | grep -q -- '--json-s
   die "this grok build ($GROK_VER) has no --json-schema; use --no-schema or pin an older grok"
 fi
 [[ "$SUB" == "cont" && -z "$SESSION" ]] && die "ccx cont requires --session <uuid>"
+[[ "$SUB" == "run"  && -n "$SESSION" ]] && die "--session resumes an existing worker; use: ccx cont --session $SESSION"
 
 # A worktree exists to contain writes; asking for read as well is a contradiction, and
 # silently resolving it either way produced a worker with the wrong powers.
 if [[ -n "$WORKTREE" ]]; then
   [[ "$PROFILE_SET" -eq 1 && "$PROFILE" == "read" ]] &&
     die "--read and --worktree conflict (a worktree is for writes). Choose one."
-  PROFILE=write
+  PROFILE=write; PROFILE_SET=1   # explicit: cont's inherit must not overwrite this
 fi
 
 # Resuming a session under a different sandbox than it was created with is refused by
@@ -501,8 +554,9 @@ printf '%s\n' "$BRIEF" > "$D/brief.md"
 # run dies -- an external SIGTERM (harness limit, ctrl-c, sleep) kills us before we can
 # report anything, and the worker's context is only recoverable if the id was written down.
 jq -n --arg r "$RUN_ID" --arg s "$PRESET_SID" --arg cwd "$CWD" --arg p "$PROFILE" \
-      --arg m "$MODEL" --arg ef "$EFFORT" \
-  '{run:$r,session:$s,cwd:$cwd,profile:$p,model:$m,effort:$ef,status:"running"}' > "$D/meta.json"
+      --arg m "$MODEL" --arg ef "$EFFORT" --arg to "$TIMEOUT" \
+  '{run:$r,session:$s,cwd:$cwd,profile:$p,model:$m,effort:$ef,
+    timeout_s:($to|tonumber),status:"running"}' > "$D/meta.json"
 
 # ---------- observability: capture the exact invocation ----------
 # The single most useful debugging artifact is what was ACTUALLY passed to grok.
@@ -578,6 +632,15 @@ else
   jq -r '.text // ""' "$D/raw.json" > "$D/envelope.json"; STATUS="$STOP"
 fi
 
+# Must precede serialisation: these were previously appended after meta.json was
+# written, so the two most diagnostic warnings never reached meta.json, runs.jsonl,
+# ccx stats or the OTLP export -- only stderr.
+if [[ "$TURNS" -le 1 && "$P1_SECONDS" -lt 20 ]]; then
+  WARN+=("suspected-short-circuit: $TURNS turn in ${P1_SECONDS}s, may not have used tools")
+  echo "ccx: warning: worker finished in $TURNS turn / ${P1_SECONDS}s -- it may not have used any tools. Check: ccx show $RUN_ID --transcript" >&2
+fi
+[[ "$STATUS" == "blocked" ]] && WARN+=("worker-blocked: brief likely underspecified")
+
 WARN_JSON=$(printf '%s\n' ${WARN+"${WARN[@]}"} | jq -R . | jq -sc 'map(select(length>0))')
 jq -n --arg r "$RUN_ID" --arg s "$SID" --arg st "$STATUS" --arg c "$COST" \
       --arg t "$TURNS" --arg e "$ELAPSED" --arg cwd "$CWD" --arg m "$MODEL" --arg ef "$EFFORT" \
@@ -604,12 +667,6 @@ if [[ "$RAW" -eq 0 ]]; then
   [[ -n "$SID" ]] && printf 'continue:        ccx cont --session %s -- "<followup>"\n' "$SID"
   printf -- '---\n'
 fi
-
-if [[ "$TURNS" -le 1 && "$P1_SECONDS" -lt 20 ]]; then
-  WARN+=("suspected-short-circuit: $TURNS turn in ${P1_SECONDS}s, may not have used tools")
-  echo "ccx: warning: worker finished in $TURNS turn / ${P1_SECONDS}s -- it may not have used any tools. Check: ccx show $RUN_ID --transcript" >&2
-fi
-[[ "$STATUS" == "blocked" ]] && WARN+=("worker-blocked: brief likely underspecified")
 
 SZ=$(wc -c < "$D/envelope.json" | tr -d ' ')
 if [[ "$SZ" -gt "$MAX_OUT" ]]; then
