@@ -81,6 +81,41 @@ are driving interactively; it is not fine for an autonomously dispatched worker.
 `/tmp` is writable under every profile, so `ccx` refuses to start a `--read` worker whose
 cwd is on a temp path rather than let the guarantee quietly not apply.
 
+## Observability
+
+Every run records to `~/.ccxai/runs/<id>/` (brief, raw phases, envelope, stderr) and appends
+one line to `~/.ccxai/runs.jsonl`.
+
+```bash
+ccx stats                 # spend, timing percentiles, failure + warning counts
+ccx stats --days 7        # windowed
+ccx log -n 20             # raw JSONL, pipe to jq
+ccx show <run> --transcript
+```
+
+`meta.json` records the **exact argv passed to grok** — the single most useful debugging
+artifact, and the one thing you cannot reconstruct after the fact. Also: phase-1 vs phase-2
+timing split, brief size, exit code, grok version, and a `warnings[]` array that flags a
+suspected short-circuit (≤1 turn in <20s) or a blocked worker.
+
+### OpenTelemetry (optional)
+
+`runs.jsonl` is the source of truth; OTLP is an **export of it**, never a replacement:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://your-collector:4318
+ccx export            # ships new runs as spans, advances a cursor
+ccx export --all      # re-send everything
+```
+
+One span per run, `service.name=ccx`, with `ccx.*` attributes (cost, turns, profile, effort,
+phase timings, status, grok version). Trace and span ids are md5-derived from the run id, so
+they are stable and collision-free across re-exports.
+
+Deliberately decoupled: the dispatch path never blocks on a network call, a collector outage
+loses nothing, and export is idempotent and resumable. Nothing is sent unless you set the
+endpoint.
+
 ## Operating notes
 
 Learned from real use, not from the docs:

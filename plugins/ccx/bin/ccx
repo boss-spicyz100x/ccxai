@@ -22,6 +22,8 @@ MAX_OUT="${CCX_MAX_OUT:-16000}"
 
 die() { printf 'ccx: %s\n' "$*" >&2; exit 2; }
 have() { command -v "$1" >/dev/null 2>&1; }
+# md5 of stdin as lowercase hex; GNU coreutils and BSD spell it differently.
+_md5() { if have md5sum; then md5sum | cut -d' ' -f1; else md5 -q; fi; }
 
 usage() {
 cat <<'EOF'
@@ -33,6 +35,9 @@ USAGE
                                                        continue an existing worker
   ccx show    <run-id> [--transcript|--envelope|--meta] inspect a past run
   ccx ls      [-n N]                                   list recent runs
+  ccx stats   [--days N] [--label L]                   aggregate spend, timing, failures
+  ccx log     [-n N]                                   raw JSONL event log (one line/run)
+  ccx export  [--all]                                  ship runs to an OTLP collector
   ccx doctor                                           check the setup
 
 PROFILES  (kernel-enforced, macOS Seatbelt / Linux Landlock)
@@ -107,6 +112,7 @@ PROFILE=read; PROFILE_SET=0; CWD_SET=0; MCP=0
 TASK_FILE=""; BRIEF=""; CWD="$PWD"; WORKTREE=""; REF="HEAD"
 SCHEMA_FILE=""; USE_SCHEMA=1; MAX_TURNS=""; TOOLS=""; WEB=0; LABEL=""
 RAW=0; CHECK=0; SESSION=""; SHOW_WHAT="envelope"; LSN=15; SCHEMA_INLINE=0
+DAYS=""; LABELF=""; EXPORT_ALL=0
 declare -a XALLOW=() XDENY=()
 
 while [[ $# -gt 0 ]]; do
@@ -134,6 +140,9 @@ while [[ $# -gt 0 ]]; do
     --check)      CHECK=1; shift ;;
     --session)    SESSION="${2:?}"; shift 2 ;;
     -n)           LSN="${2:?}"; shift 2 ;;
+    --days)       DAYS="${2:?}"; shift 2 ;;
+    --all)        EXPORT_ALL=1; shift ;;
+    --label-filter) LABELF="${2:?}"; shift 2 ;;
     --transcript) SHOW_WHAT=transcript; shift ;;
     --envelope)   SHOW_WHAT=envelope; shift ;;
     --meta)       SHOW_WHAT=meta; shift ;;
@@ -167,6 +176,109 @@ if [[ "$SUB" == "ls" ]]; then
       jq -r --arg d "$d" '"\($d)  \(.status // "?")  turns=\(.turns // "?")  $\(.cost // 0)  \(.session // "-")"' "$m"
     else echo "$d  (incomplete)"; fi
   done
+  exit 0
+fi
+
+if [[ "$SUB" == "log" ]]; then
+  [[ -f "$CCX_HOME/runs.jsonl" ]] || { echo "no runs logged yet"; exit 0; }
+  tail -"$LSN" "$CCX_HOME/runs.jsonl"
+  exit 0
+fi
+
+if [[ "$SUB" == "stats" ]]; then
+  L="$CCX_HOME/runs.jsonl"
+  [[ -f "$L" ]] || { echo "no runs logged yet (runs before instrumentation are not included)"; exit 0; }
+  CUT=""
+  [[ -n "$DAYS" ]] && CUT=$(date -u -v-"${DAYS}"d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+                            || date -u -d "${DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)
+  jq -s --arg cut "$CUT" --arg lab "$LABELF" '
+    map(select(($cut == "" or .ts >= $cut) and ($lab == "" or .label == $lab)))
+    | if length == 0 then "no runs match" else
+    { runs: length,
+      total_usd: (map(.cost) | add | .*10000 | round | ./10000),
+      usd_per_run: ((map(.cost) | add / length) * 10000 | round | ./10000),
+      wall_clock_min: ((map(.seconds) | add) / 60 | round),
+      by_status:  (group_by(.status) | map({(.[0].status): length}) | add),
+      by_profile: (group_by(.profile) | map({(.[0].profile): length}) | add),
+      spend_by_label: (group_by(.label) | map({(.[0].label): ((map(.cost)|add)*10000|round|./10000)})
+                       | add),
+      seconds: (map(.seconds) | sort |
+                {p50: .[(length/2|floor)], p90: .[(length*0.9|floor)], max: .[length-1]}),
+      phase2_overhead_pct: ((map(.phase2_seconds) | add) as $p2
+                            | (map(.seconds) | add) as $t
+                            | if $t > 0 then ($p2 / $t * 1000 | round / 10) else 0 end),
+      runs_with_warnings: (map(select(.warnings | length > 0)) | length),
+      warnings: (map(.warnings[]) | group_by(.) | map({(.[0]|split(":")[0]): length}) | add) }
+    end' "$L"
+  echo
+  echo "recent failures / warnings:"
+  jq -r 'select((.status|test("blocked|timeout|killed")) or (.warnings|length>0))
+         | "  \(.ts)  \(.run)  \(.status)  \(.warnings|join("; "))"' "$L" | tail -8
+  exit 0
+fi
+
+if [[ "$SUB" == "export" ]]; then
+  # OTLP is an EXPORT of the local log, never the source of truth: the JSONL must
+  # survive a collector being down, and the hot path must never block on a network call.
+  EP="${OTEL_EXPORTER_OTLP_ENDPOINT:-}"
+  [[ -n "$EP" ]] || die "set OTEL_EXPORTER_OTLP_ENDPOINT (e.g. https://collector:4318)"
+  L="$CCX_HOME/runs.jsonl"; [[ -f "$L" ]] || { echo "nothing to export"; exit 0; }
+  CUR="$CCX_HOME/.export-cursor"
+  LAST=$([[ -f "$CUR" && "$EXPORT_ALL" -eq 0 ]] && cat "$CUR" || echo "")
+  PEND=$(jq -c --arg last "$LAST" 'select($last == "" or .ts > $last)' "$L")
+  [[ -n "$PEND" ]] || { echo "up to date (cursor $LAST)"; exit 0; }
+  N=$(printf '%s\n' "$PEND" | wc -l | tr -d ' ')
+  # Derive ids by hashing, not by transcoding the run name: the previous scheme mapped
+  # most characters to "0", leaving a near-constant 16-char prefix, so spanIds collided.
+  PEND=$(printf '%s\n' "$PEND" | while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    _r=$(jq -r '.run' <<<"$line")
+    _t=$(printf 'ccx-trace:%s' "$_r" | _md5 | cut -c1-32)
+    _s=$(printf 'ccx-span:%s'  "$_r" | _md5 | cut -c1-16)
+    jq -c --arg t "$_t" --arg s "$_s" '. + {_tid:$t, _sid:$s}' <<<"$line"
+  done)
+  BODY=$(printf '%s\n' "$PEND" | jq -s --arg svc "ccx" '{
+    resourceSpans: [{
+      resource: {attributes: [
+        {key:"service.name",  value:{stringValue:$svc}},
+        {key:"service.version",value:{stringValue:"0.1.0"}}]},
+      scopeSpans: [{ scope: {name:"ccx"}, spans: (map(
+        (.ts | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) as $st |
+        {
+          traceId: ._tid,
+          spanId:  ._sid,
+          name: ("ccx.\(.sub)"),
+          kind: 3,
+          startTimeUnixNano: ($st * 1000000000 | tostring),
+          endTimeUnixNano:   (($st + .seconds) * 1000000000 | tostring),
+          status: {code: (if .status == "done" then 1 else 2 end)},
+          attributes: [
+            {key:"ccx.run",     value:{stringValue:.run}},
+            {key:"ccx.label",   value:{stringValue:.label}},
+            {key:"ccx.profile", value:{stringValue:.profile}},
+            {key:"ccx.effort",  value:{stringValue:.effort}},
+            {key:"ccx.status",  value:{stringValue:.status}},
+            {key:"ccx.model",   value:{stringValue:(.model // "grok-4.6")}},
+            {key:"ccx.grok_version", value:{stringValue:.grok}},
+            {key:"ccx.cost_usd",value:{doubleValue:.cost}},
+            {key:"ccx.turns",   value:{intValue:(.turns|tostring)}},
+            {key:"ccx.phase1_seconds",value:{intValue:(.phase1_seconds|tostring)}},
+            {key:"ccx.phase2_seconds",value:{intValue:(.phase2_seconds|tostring)}},
+            {key:"ccx.brief_bytes",   value:{intValue:(.brief_bytes|tostring)}},
+            {key:"ccx.warning_count", value:{intValue:(.warnings|length|tostring)}}
+          ]
+        }))}]}]}')
+  : > /tmp/ccx-otlp.out   # never echo the previous attempt's body on a connect failure
+  CODE=$(printf '%s' "$BODY" | curl -sS -o /tmp/ccx-otlp.out -w '%{http_code}' \
+    -X POST "${EP%/}/v1/traces" -H 'Content-Type: application/json' \
+    ${OTEL_EXPORTER_OTLP_HEADERS:+-H "$OTEL_EXPORTER_OTLP_HEADERS"} --data-binary @- 2>&1) || CODE=000
+  if [[ "$CODE" =~ ^2 ]]; then
+    printf '%s\n' "$PEND" | jq -r .ts | sort | tail -1 > "$CUR"
+    echo "exported $N span(s) to ${EP%/}/v1/traces (HTTP $CODE); cursor -> $(cat "$CUR")"
+  else
+    echo "export failed (HTTP $CODE) -- local log intact, retry later" >&2
+    head -c 300 /tmp/ccx-otlp.out >&2; echo; exit 1
+  fi
   exit 0
 fi
 
@@ -329,6 +441,13 @@ jq -n --arg r "$RUN_ID" --arg s "$PRESET_SID" --arg cwd "$CWD" --arg p "$PROFILE
       --arg m "$MODEL" --arg ef "$EFFORT" \
   '{run:$r,session:$s,cwd:$cwd,profile:$p,model:$m,effort:$ef,status:"running"}' > "$D/meta.json"
 
+# ---------- observability: capture the exact invocation ----------
+# The single most useful debugging artifact is what was ACTUALLY passed to grok.
+# Long values (schemas, rules) are truncated so the record stays readable.
+declare -a WARN=()
+CMD_JSON=$(printf '%s\n' "${ARGS[@]}" \
+  | jq -R 'if length > 160 then .[0:160] + "…[truncated]" else . end' | jq -sc .)
+
 # ---------- dispatch ----------
 START=$(date +%s)
 set +e
@@ -339,6 +458,8 @@ timeout --kill-after=30s "$TIMEOUT" "$GROK_BIN" --no-auto-update \
 RC=$?
 set -e
 ELAPSED=$(( $(date +%s) - START ))
+P1_SECONDS=$ELAPSED
+P2_SECONDS=0
 
 if [[ $RC -eq 124 || $RC -eq 137 ]]; then
   jq -n --arg r "$RUN_ID" --arg t "$TIMEOUT" --arg s "$PRESET_SID" --arg cwd "$CWD" \
@@ -377,6 +498,8 @@ if [[ "$USE_SCHEMA" -eq 1 && "$SCHEMA_INLINE" -eq 0 && -n "$SID" ]]; then
     >"$D/raw2.json" 2>>"$D/stderr.log"
   RC2=$?
   set -e
+  P2_SECONDS=$(( $(date +%s) - START - P1_SECONDS ))
+  [[ $RC2 -ne 0 ]] && WARN+=("phase2-format-failed")
   if [[ $RC2 -eq 0 ]] && jq -e '.structuredOutput' >/dev/null 2>&1 <"$D/raw2.json"; then
     C2=$(jq -r '.total_cost_usd // 0' "$D/raw2.json")
     COST=$(python3 -c "print(round($COST + $C2, 8))" 2>/dev/null || echo "$COST")
@@ -394,11 +517,23 @@ else
   jq -r '.text // ""' "$D/raw.json" > "$D/envelope.json"; STATUS="$STOP"
 fi
 
+WARN_JSON=$(printf '%s\n' ${WARN+"${WARN[@]}"} | jq -R . | jq -sc 'map(select(length>0))')
 jq -n --arg r "$RUN_ID" --arg s "$SID" --arg st "$STATUS" --arg c "$COST" \
       --arg t "$TURNS" --arg e "$ELAPSED" --arg cwd "$CWD" --arg m "$MODEL" --arg ef "$EFFORT" \
-      --arg gv "$GROK_VER" --arg p "$PROFILE" \
-  '{run:$r,session:$s,status:$st,cost:($c|tonumber),turns:($t|tonumber),
-    seconds:($e|tonumber),cwd:$cwd,model:$m,effort:$ef,profile:$p,grok:$gv}' > "$D/meta.json"
+      --arg gv "$GROK_VER" --arg p "$PROFILE" --arg lb "${LABEL:-$SUB}" --arg sub "$SUB" \
+      --arg p1 "$P1_SECONDS" --arg p2 "$P2_SECONDS" --arg rc "$RC" --arg stop "$STOP" \
+      --argjson cmd "$CMD_JSON" --argjson warn "$WARN_JSON" \
+      --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg bb "$(wc -c < "$D/brief.md" | tr -d ' ')" \
+  '{ts:$ts,run:$r,session:$s,sub:$sub,label:$lb,status:$st,stop_reason:$stop,
+    cost:($c|tonumber),turns:($t|tonumber),seconds:($e|tonumber),
+    phase1_seconds:($p1|tonumber),phase2_seconds:($p2|tonumber),
+    brief_bytes:($bb|tonumber),exit_code:($rc|tonumber),
+    cwd:$cwd,model:$m,effort:$ef,profile:$p,grok:$gv,warnings:$warn,cmd:$cmd}' > "$D/meta.json"
+# Append-only event log: one compact line per run, so `jq -s` over a single file
+# answers "what did this cost / what keeps failing" without globbing run dirs.
+jq -c '{ts,run,label,sub,status,profile,effort,cost,turns,seconds,phase1_seconds,
+        phase2_seconds,brief_bytes,exit_code,warnings,grok,cwd}' "$D/meta.json" \
+  >> "$CCX_HOME/runs.jsonl" 2>/dev/null || true
 
 # ---------- report (small!) ----------
 if [[ "$RAW" -eq 0 ]]; then
@@ -409,9 +544,11 @@ if [[ "$RAW" -eq 0 ]]; then
   printf -- '---\n'
 fi
 
-if [[ "$TURNS" -le 1 && "$ELAPSED" -lt 20 ]]; then
-  echo "ccx: warning: worker finished in $TURNS turn / ${ELAPSED}s -- it may not have used any tools. Check: ccx show $RUN_ID --transcript" >&2
+if [[ "$TURNS" -le 1 && "$P1_SECONDS" -lt 20 ]]; then
+  WARN+=("suspected-short-circuit: $TURNS turn in ${P1_SECONDS}s, may not have used tools")
+  echo "ccx: warning: worker finished in $TURNS turn / ${P1_SECONDS}s -- it may not have used any tools. Check: ccx show $RUN_ID --transcript" >&2
 fi
+[[ "$STATUS" == "blocked" ]] && WARN+=("worker-blocked: brief likely underspecified")
 
 SZ=$(wc -c < "$D/envelope.json" | tr -d ' ')
 if [[ "$SZ" -gt "$MAX_OUT" ]]; then
