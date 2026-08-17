@@ -93,6 +93,11 @@ Learned from real use, not from the docs:
   breakage from a broken baseline.
 - **Never edit `ccx` while a run is in flight.** Bash reads scripts lazily by byte offset;
   the running process will resume into rewritten content and corrupt that run.
+- **A green suite is not proof the change was exercised.** On the real write task the
+  full suite passed and exited 0 — but the test covering the changed code `SKIP`s when
+  game packages are absent, and *no* test referenced the changed function at all. The
+  worker disclosed the skips honestly; reading the log is what turned "all green" into
+  "verified by inspection, not by execution". Check what actually ran.
 - **Pin the CLI if you want stability.** `grok` auto-updates and has dropped flags across
   a major (`--check`, `--best-of-n` went away in 1.0). `ccx` asserts what it needs and
   records the version per run, but `auto_update = false` in `~/.grok/config.toml` is the
@@ -103,7 +108,7 @@ Learned from real use, not from the docs:
 | Path | Evidence |
 |---|---|
 | `--read` review | **Proven.** Found 6 real defects in a 2708-line production subsystem; all 6 verified against source. Under $0.30. |
-| `--write` in a worktree | **Works, lightly used.** Isolation verified (writes confined, main checkout clean, `cont` resumes in the worktree). Read every diff. |
+| `--write` in a worktree | **Proven on real code.** Fixed a confirmed defect in a production TS pipeline: one-line diff, constraints held, typecheck + 37-file suite green, main checkout untouched. $0.10 / 154s. |
 | `grok-worker` agent | **Untested.** Ships, never run. |
 
 See `DESIGN.md` for the full rationale, prior art, and measurements.

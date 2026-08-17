@@ -286,6 +286,31 @@ as an operational hazard when iterating on a script that is currently dispatchin
 
 ---
 
+## 6c. First real write task
+
+Target: the `n <= 45` ceiling this tool's own review had confirmed in a production
+Cloudflare Worker pipeline. Baseline established first (deps installed in the worktree,
+typecheck 0, suite `ALL PASS`) so any failure would be attributable.
+
+Worker: 15 turns, 154s, $0.10. One-line diff, `test/` untouched, both acceptance commands
+green. The envelope's `evidence[]` was accurate and volunteered its own caveats.
+
+Two things only independent verification caught:
+
+1. **The green suite proved less than it appeared.** `slot-coverage.test.ts` `SKIP`s
+   without `char1/char2.pkg` and exits 0, and no test references `extractCharDerived`.
+   The change is verified by inspection and typecheck, not by an executed test. Trusting
+   `evidence[]` at face value would have recorded this as test-verified.
+2. **A design decision was hiding in a one-line diff.** The worker gated on
+   `charSources.has(n)` and rebuilt the path, preserving the original 8MB read window.
+   Reusing `charSources.get(n)` instead also inherits the 64KB window the author chose
+   for those same packages — better on Worker memory, worse on subrequest count. That is
+   a production tradeoff for the repo owner, not something a worker or an orchestrator
+   should silently pick.
+
+The second is the more interesting one: the worker did the job correctly and still left a
+judgement call on the table. Reviewing the diff is not just defect-hunting.
+
 ## 7. What was built
 
 ```
