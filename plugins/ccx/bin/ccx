@@ -237,11 +237,35 @@ if [[ "$SUB" == "export" ]]; then
   EP="${OTEL_EXPORTER_OTLP_ENDPOINT:-}"
   [[ -n "$EP" ]] || die "set OTEL_EXPORTER_OTLP_ENDPOINT (e.g. https://collector:4318)"
   L="$CCX_HOME/runs.jsonl"; [[ -f "$L" ]] || { echo "nothing to export"; exit 0; }
-  CUR="$CCX_HOME/.export-cursor"
+  CUR="$CCX_HOME/.export-cursor"; SEEN="$CCX_HOME/.export-seen"
+
+  # mkdir is atomic, so it doubles as a lock. Two concurrent exports would otherwise
+  # both read the same pending set and both POST it.
+  LOCK="$CCX_HOME/.export.lock"
+  mkdir "$LOCK" 2>/dev/null || die "another ccx export is running (stale? rmdir $LOCK)"
+  trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+
   LAST=$([[ -f "$CUR" && "$EXPORT_ALL" -eq 0 ]] && cat "$CUR" || echo "")
-  PEND=$(jq -c --arg last "$LAST" 'select($last == "" or .ts > $last)' "$L")
-  [[ -n "$PEND" ]] || { echo "up to date (cursor $LAST)"; exit 0; }
-  N=$(printf '%s\n' "$PEND" | wc -l | tr -d ' ')
+  SEEN_JSON='[]'
+  [[ -f "$SEEN" && "$EXPORT_ALL" -eq 0 ]] && SEEN_JSON=$(jq -R . "$SEEN" | jq -sc .)
+
+  # Parse tolerantly. This log is append-only and gets written by more than one path,
+  # so a single malformed line must not permanently wedge every future export.
+  TOTAL=$(grep -c . "$L" || echo 0)
+  PARSED=$(jq -R -c 'fromjson? // empty' "$L")
+  NPARSED=$(printf '%s' "$PARSED" | grep -c . || echo 0)
+  VALID=$(printf '%s\n' "$PARSED" | jq -c 'select((.ts|type)=="string" and (.run|type)=="string")')
+  NVALID=$(printf '%s' "$VALID" | grep -c . || echo 0)
+  (( TOTAL - NPARSED > 0 )) && echo "ccx: skipped $((TOTAL-NPARSED)) unparseable line(s) in runs.jsonl" >&2
+  (( NPARSED - NVALID > 0 )) && echo "ccx: skipped $((NPARSED-NVALID)) record(s) missing ts/run" >&2
+
+  # `.ts` has 1-second resolution, so a strict `>` would permanently drop a run that
+  # landed in the same second as the cursor. Take `>=` and exclude ids already sent.
+  PEND=$(printf '%s\n' "$VALID" | jq -c --arg last "$LAST" --argjson seen "$SEEN_JSON" '
+    select($last == "" or .ts > $last or (.ts == $last and ([.run] | inside($seen) | not)))')
+  [[ -n "$PEND" ]] || { echo "up to date (cursor ${LAST:-none})"; exit 0; }
+  N=$(printf '%s' "$PEND" | grep -c .)
+
   # Derive ids by hashing, not by transcoding the run name: the previous scheme mapped
   # most characters to "0", leaving a near-constant 16-char prefix, so spanIds collided.
   PEND=$(printf '%s\n' "$PEND" | while IFS= read -r line; do
@@ -251,6 +275,7 @@ if [[ "$SUB" == "export" ]]; then
     _s=$(printf 'ccx-span:%s'  "$_r" | _md5 | cut -c1-16)
     jq -c --arg t "$_t" --arg s "$_s" '. + {_tid:$t, _sid:$s}' <<<"$line"
   done)
+
   BODY=$(printf '%s\n' "$PEND" | jq -s --arg svc "ccx" '{
     resourceSpans: [{
       resource: {attributes: [
@@ -261,37 +286,54 @@ if [[ "$SUB" == "export" ]]; then
         {
           traceId: ._tid,
           spanId:  ._sid,
-          name: ("ccx.\(.sub)"),
+          name: ("ccx." + (.sub // "run")),
           kind: 3,
           startTimeUnixNano: ($st * 1000000000 | tostring),
-          endTimeUnixNano:   (($st + .seconds) * 1000000000 | tostring),
+          endTimeUnixNano:   (($st + (.seconds // 0)) * 1000000000 | tostring),
           status: {code: (if .status == "done" then 1 else 2 end)},
           attributes: [
             {key:"ccx.run",     value:{stringValue:.run}},
-            {key:"ccx.label",   value:{stringValue:.label}},
-            {key:"ccx.profile", value:{stringValue:.profile}},
-            {key:"ccx.effort",  value:{stringValue:.effort}},
-            {key:"ccx.status",  value:{stringValue:.status}},
+            {key:"ccx.label",   value:{stringValue:(.label // "unknown")}},
+            {key:"ccx.profile", value:{stringValue:(.profile // "unknown")}},
+            {key:"ccx.effort",  value:{stringValue:(.effort // "unknown")}},
+            {key:"ccx.status",  value:{stringValue:(.status // "unknown")}},
             {key:"ccx.model",   value:{stringValue:(.model // "grok-4.6")}},
-            {key:"ccx.grok_version", value:{stringValue:.grok}},
-            {key:"ccx.cost_usd",value:{doubleValue:.cost}},
-            {key:"ccx.turns",   value:{intValue:(.turns|tostring)}},
-            {key:"ccx.phase1_seconds",value:{intValue:(.phase1_seconds|tostring)}},
-            {key:"ccx.phase2_seconds",value:{intValue:(.phase2_seconds|tostring)}},
-            {key:"ccx.brief_bytes",   value:{intValue:(.brief_bytes|tostring)}},
-            {key:"ccx.warning_count", value:{intValue:(.warnings|length|tostring)}}
+            {key:"ccx.grok_version", value:{stringValue:(.grok // "unknown")}},
+            {key:"ccx.cost_usd",value:{doubleValue:(.cost // 0)}},
+            {key:"ccx.turns",   value:{intValue:((.turns // 0)|tostring)}},
+            {key:"ccx.phase1_seconds",value:{intValue:((.phase1_seconds // 0)|tostring)}},
+            {key:"ccx.phase2_seconds",value:{intValue:((.phase2_seconds // 0)|tostring)}},
+            {key:"ccx.brief_bytes",   value:{intValue:((.brief_bytes // 0)|tostring)}},
+            {key:"ccx.warning_count", value:{intValue:(((.warnings // [])|length)|tostring)}}
           ]
         }))}]}]}')
+
+  # OTEL_EXPORTER_OTLP_HEADERS is spec'd as comma-separated key=value pairs; passing it
+  # raw to curl -H only works for a single "Key: value" string.
+  declare -a HDRS=()
+  if [[ -n "${OTEL_EXPORTER_OTLP_HEADERS:-}" ]]; then
+    IFS=',' read -ra _kvs <<< "$OTEL_EXPORTER_OTLP_HEADERS"
+    for _kv in "${_kvs[@]}"; do
+      _kv="${_kv#"${_kv%%[![:space:]]*}"}"
+      if [[ "$_kv" == *"="* ]]; then HDRS+=(-H "${_kv%%=*}: ${_kv#*=}")
+      elif [[ -n "$_kv" ]];   then HDRS+=(-H "$_kv"); fi
+    done
+  fi
+
   : > /tmp/ccx-otlp.out   # never echo the previous attempt's body on a connect failure
   CODE=$(printf '%s' "$BODY" | curl -sS -o /tmp/ccx-otlp.out -w '%{http_code}' \
     -X POST "${EP%/}/v1/traces" -H 'Content-Type: application/json' \
-    ${OTEL_EXPORTER_OTLP_HEADERS:+-H "$OTEL_EXPORTER_OTLP_HEADERS"} --data-binary @- 2>&1) || CODE=000
+    ${HDRS+"${HDRS[@]}"} --data-binary @- 2>/dev/null) || CODE=000
   if [[ "$CODE" =~ ^2 ]]; then
-    printf '%s\n' "$PEND" | jq -r .ts | sort | tail -1 > "$CUR"
-    echo "exported $N span(s) to ${EP%/}/v1/traces (HTTP $CODE); cursor -> $(cat "$CUR")"
+    NEWLAST=$(printf '%s\n' "$PEND" | jq -r .ts | sort | tail -1)
+    if [[ "$NEWLAST" == "$LAST" && -f "$SEEN" ]]; then cp "$SEEN" "$SEEN.tmp"; else : > "$SEEN.tmp"; fi
+    printf '%s\n' "$PEND" | jq -r --arg t "$NEWLAST" 'select(.ts == $t) | .run' >> "$SEEN.tmp"
+    sort -u "$SEEN.tmp" > "$SEEN"; rm -f "$SEEN.tmp"
+    printf '%s\n' "$NEWLAST" > "$CUR"
+    echo "exported $N span(s) to ${EP%/}/v1/traces (HTTP $CODE); cursor -> $NEWLAST"
   else
     echo "export failed (HTTP $CODE) -- local log intact, retry later" >&2
-    head -c 300 /tmp/ccx-otlp.out >&2; echo; exit 1
+    head -c 300 /tmp/ccx-otlp.out >&2; echo >&2; exit 1
   fi
   exit 0
 fi
