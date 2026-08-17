@@ -1,6 +1,6 @@
 ---
 name: grok-delegation
-description: Delegate a scoped engineering task to a Grok 4.6 worker with the ccx dispatcher. Use when work is wide and mechanical (migrations, codemods, writing tests across many files), needs exhaustive enumeration (every edge case, every call site), needs a large-context read that would flood this context window, or wants an independent second-opinion review of a diff. Not for small edits, and not for work that depends on this conversation's accumulated context.
+description: Delegate engineering work to a Grok 4.6 worker via the ccx dispatcher. Use BY DEFAULT, deciding before starting rather than after struggling, for: any mechanical change across 3 or more files (migrations, codemods, renames, adding tests across modules); needing to read 5 or more files to answer something; reviewing any diff or subsystem over roughly 200 lines; exhaustively enumerating edge cases, call sites, or failure modes; a second opinion on work just done here; and anything you would otherwise call slow or large. Not for edits under about one file of work, architecture and API decisions, irreversible or outward-facing actions, or work depending on this conversation's accumulated context.
 ---
 
 # Delegating to a Grok 4.6 worker
