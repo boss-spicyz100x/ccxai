@@ -103,6 +103,29 @@ Learned from real use, not from the docs:
   records the version per run, but `auto_update = false` in `~/.grok/config.toml` is the
   real fix.
 
+## Per-repo setup (do this, not a global CLAUDE.md)
+
+The skill already knows *when* to delegate. What it cannot know is what your repo's
+acceptance command is, or what a fresh worktree needs before that command can run — and
+a brief without a real acceptance command should not be delegated at all.
+
+Put those three facts in the target repo's own `CLAUDE.md`. Do **not** put delegation
+guidance in a global `~/.claude/CLAUDE.md`: it would load in every project, duplicate
+`SKILL.md`, and drift from it.
+
+```markdown
+## Delegating to a Grok worker (ccx)
+
+- Acceptance command: `cd <subdir> && <typecheck> && <test>`
+- Fresh worktree prep: `<install deps>` from the repo root — `git worktree add`
+  gives a clean checkout with no dependencies, so the acceptance command cannot
+  run until this is done.
+- Green ≠ exercised: <name the tests that skip, and what they need to actually run>.
+```
+
+That third line is the one that earns its place. A suite can exit 0 having skipped the
+very tests that cover your change.
+
 ## Status
 
 | Path | Evidence |
