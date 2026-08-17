@@ -508,8 +508,16 @@ if [[ "$SUB" == "fanout" ]]; then
       [[ "$ex" == "0" ]] || rc=1
     fi
   done
-  tot=$(jq -s 'map(.cost // 0)|add' $(for s in "${SLUGS[@]}"; do
-          ls -dt "$CCX_HOME"/runs/*-"$s"-*/meta.json 2>/dev/null | head -1; done) 2>/dev/null || echo 0)
+  # Collect paths into an array: unquoted command substitution here would split a
+  # CCX_HOME containing a space into bogus file arguments.
+  declare -a METAS=()
+  for s in "${SLUGS[@]}"; do
+    mf=$(ls -dt "$CCX_HOME"/runs/*-"$s"-*/meta.json 2>/dev/null | head -1 || true)
+    [[ -n "$mf" ]] && METAS+=("$mf")
+  done
+  if (( ${#METAS[@]} )); then
+    tot=$(jq -s 'map(.cost // 0)|add' "${METAS[@]}" 2>/dev/null || echo 0)
+  else tot=0; fi
   printf '\ntotal $%s across %s worker(s)\n' "$(printf '%.2f' "${tot:-0}")" "${#SLUGS[@]}"
   [[ "$PROFILE" == "write" ]] && echo "worktrees under $CCX_HOME/worktrees/ -- review each diff before merging"
   (( rc == 0 )) || echo "one or more workers did not return status=done -- see $OUT/*.err" >&2
