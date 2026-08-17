@@ -210,10 +210,11 @@ if [[ "$SUB" == "stats" ]]; then
       runs_with_warnings: (map(select(.warnings | length > 0)) | length),
       warnings: (map(.warnings[]) | group_by(.) | map({(.[0]|split(":")[0]): length}) | add) }
     end' "$L"
-  echo
-  echo "recent failures / warnings:"
-  jq -r 'select((.status|test("blocked|timeout|killed")) or (.warnings|length>0))
-         | "  \(.ts)  \(.run)  \(.status)  \(.warnings|join("; "))"' "$L" | tail -8
+  { echo
+    echo "recent failures / warnings:"
+    jq -r 'select((.status|test("blocked|timeout|killed")) or (.warnings|length>0))
+           | "  \(.ts)  \(.run)  \(.status)  \(.warnings|join("; "))"' "$L" | tail -8
+  } >&2
   exit 0
 fi
 
