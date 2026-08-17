@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+# ccx — dispatch a task to a Grok 4.6 worker and return a small, schema-validated envelope.
+#
+# Uses the Grok Build CLI's OAuth session (your grok.com subscription).
+# No XAI_API_KEY, no pay-as-you-go billing.
+#
+# Design contract:
+#   1. The orchestrator ships a BRIEF, never context. The worker reads files itself.
+#   2. stdout stays SMALL (envelope only). Full transcript goes to the run dir.
+#   3. Safety is pinned per-invocation via the kernel sandbox, never inherited
+#      from ~/.grok/config.toml (which may be yolo/always-approve).
+set -euo pipefail
+
+VERSION="0.1.0"
+CCX_HOME="${CCX_HOME:-$HOME/.ccxai}"
+GROK_BIN="${GROK_BIN:-$(command -v grok 2>/dev/null || echo "$HOME/.grok/bin/grok")}"
+
+MODEL="${CCX_MODEL:-grok-4.6}"
+EFFORT="${CCX_EFFORT:-xhigh}"
+TIMEOUT="${CCX_TIMEOUT:-1800}"
+MAX_OUT="${CCX_MAX_OUT:-16000}"
+
+die() { printf 'ccx: %s\n' "$*" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+cat <<'EOF'
+ccx — Grok 4.6 worker dispatch (orchestrator-worker)
+
+USAGE
+  ccx run     [opts] (--task FILE | -- <brief text>)   dispatch a fresh worker
+  ccx cont    --session <uuid> [opts] (--task FILE | -- <text>)
+                                                       continue an existing worker
+  ccx show    <run-id> [--transcript|--envelope|--meta] inspect a past run
+  ccx ls      [-n N]                                   list recent runs
+  ccx doctor                                           check the setup
+
+PROFILES  (kernel-enforced, macOS Seatbelt / Linux Landlock)
+  --read      DEFAULT. sandbox=read-only: reads anything, writes NOTHING to the
+              filesystem. Full toolset incl. shell is safe here.
+              NOTE: network is NOT blocked on macOS (Seatbelt no-ops it; the
+              grok docs' "child network blocked" is Linux/Landlock only).
+  --write     sandbox=workspace: writes confined to the run cwd (+/tmp).
+              Adds a deny list for push/sudo/gh/rm. Use with --worktree.
+
+OPTIONS
+  --task FILE       brief file ('-' for stdin). Or pass the brief after '--'.
+  --cwd DIR         working directory for the worker (default: $PWD)
+  --worktree NAME   create/reuse a git worktree and run there (implies --write)
+  --ref REF         base ref for a new worktree (default HEAD)
+  --schema FILE     JSON Schema for the return envelope (default: built-in)
+  --no-schema       free-form prose instead of a validated envelope
+  --schema-inline   constrain the worker's own turn (1 call, but the schema can
+                    hijack turn 1 and return an empty answer -- not recommended)
+  --model ID        default grok-4.6
+  --effort LEVEL    low|medium|high|xhigh   (default xhigh)
+  --max-turns N     default 30 (read) / 60 (write)
+  --timeout SEC     default 1800
+  --tools LIST      override the built-in tool allowlist
+  --allow RULE      extra permission allow rule (repeatable)
+  --deny RULE       extra permission deny rule (repeatable)
+  --web             permit web_search / web_fetch (off by default)
+  --mcp             permit MCP tools (off by default: MCP servers run OUTSIDE
+                    the sandbox, so they can write to remote systems)
+  --label TEXT      label for the run directory
+  --raw             print only the envelope JSON (no header)
+  --check           require the worker to verify its own work before returning
+
+EXIT CODES
+  0 done|partial   3 blocked   4 timeout   5 worker/parse error
+EOF
+}
+
+# ---------- default envelope ----------
+read -r -d '' DEFAULT_SCHEMA <<'EOF' || true
+{"type":"object","additionalProperties":false,
+ "required":["status","summary","files_changed","evidence","open_questions"],
+ "properties":{
+  "status":{"type":"string","enum":["done","partial","blocked"]},
+  "summary":{"type":"string","description":"Under 120 words: what you did and why."},
+  "files_changed":{"type":"array","items":{"type":"object","additionalProperties":false,
+    "required":["path","what"],
+    "properties":{"path":{"type":"string"},"what":{"type":"string"}}}},
+  "evidence":{"type":"array","items":{"type":"string"},
+    "description":"Commands you actually ran and their real results, e.g. 'pytest -q -> 41 passed'."},
+  "open_questions":{"type":"array","items":{"type":"string"}},
+  "next_steps":{"type":"array","items":{"type":"string"}}}}
+EOF
+
+read -r -d '' WORKER_RULES <<'EOF' || true
+You are a WORKER dispatched by an orchestrator agent. Operating rules:
+- You will NOT get a mid-run answer to any question. Do not ask for clarification.
+  If genuinely blocked, stop and return status="blocked" with specific open_questions.
+- The orchestrator reads ONLY your returned envelope, never your transcript.
+  Everything that matters must be in the envelope.
+- evidence[] must contain commands you ACTUALLY ran and their REAL output verdicts.
+  Never claim a test passed that you did not run. An honest "partial" beats a false "done".
+- Prefer reading the real code over assuming. You have a large context; use it.
+- Keep summary under 120 words.
+EOF
+
+# ---------- arg parsing ----------
+SUB="${1:-}"; [[ -n "$SUB" ]] || { usage; exit 2; }; shift || true
+case "$SUB" in -h|--help|help) usage; exit 0 ;; -v|--version) echo "ccx $VERSION"; exit 0 ;; esac
+
+PROFILE=read; PROFILE_SET=0; CWD_SET=0; MCP=0
+TASK_FILE=""; BRIEF=""; CWD="$PWD"; WORKTREE=""; REF="HEAD"
+SCHEMA_FILE=""; USE_SCHEMA=1; MAX_TURNS=""; TOOLS=""; WEB=0; LABEL=""
+RAW=0; CHECK=0; SESSION=""; SHOW_WHAT="envelope"; LSN=15; SCHEMA_INLINE=0
+declare -a XALLOW=() XDENY=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --read)       PROFILE=read;  PROFILE_SET=1; shift ;;
+    --write)      PROFILE=write; PROFILE_SET=1; shift ;;
+    --task)       TASK_FILE="${2:?}"; shift 2 ;;
+    --cwd)        CWD="${2:?}"; CWD_SET=1; shift 2 ;;
+    --worktree)   WORKTREE="${2:?}"; shift 2 ;;
+    --ref)        REF="${2:?}"; shift 2 ;;
+    --schema)     SCHEMA_FILE="${2:?}"; shift 2 ;;
+    --no-schema)  USE_SCHEMA=0; shift ;;
+    --schema-inline) SCHEMA_INLINE=1; shift ;;
+    --model)      MODEL="${2:?}"; shift 2 ;;
+    --effort)     EFFORT="${2:?}"; shift 2 ;;
+    --max-turns)  MAX_TURNS="${2:?}"; shift 2 ;;
+    --timeout)    TIMEOUT="${2:?}"; shift 2 ;;
+    --tools)      TOOLS="${2:?}"; shift 2 ;;
+    --allow)      XALLOW+=("${2:?}"); shift 2 ;;
+    --deny)       XDENY+=("${2:?}"); shift 2 ;;
+    --web)        WEB=1; shift ;;
+    --mcp)        MCP=1; shift ;;
+    --label)      LABEL="${2:?}"; shift 2 ;;
+    --raw)        RAW=1; shift ;;
+    --check)      CHECK=1; shift ;;
+    --session)    SESSION="${2:?}"; shift 2 ;;
+    -n)           LSN="${2:?}"; shift 2 ;;
+    --transcript) SHOW_WHAT=transcript; shift ;;
+    --envelope)   SHOW_WHAT=envelope; shift ;;
+    --meta)       SHOW_WHAT=meta; shift ;;
+    --)           shift; BRIEF="$*"; break ;;
+    -*)           die "unknown option: $1" ;;
+    *)            BRIEF="${BRIEF:+$BRIEF }$1"; shift ;;
+  esac
+done
+
+# ---------- subcommands that don't dispatch ----------
+if [[ "$SUB" == "doctor" ]]; then
+  echo "ccx $VERSION"
+  printf '%-14s %s\n' "grok:" "$([[ -x "$GROK_BIN" ]] && "$GROK_BIN" --version 2>/dev/null || echo 'MISSING')"
+  printf '%-14s %s\n' "auth:" "$("$GROK_BIN" models 2>&1 | head -1)"
+  for t in jq git timeout uuidgen; do
+    printf '%-14s %s\n' "$t:" "$(have "$t" && command -v "$t" || echo 'MISSING')"; done
+  printf '%-14s %s\n' "runs:" "$CCX_HOME/runs"
+  printf '%-14s %s\n' "defaults:" "$MODEL / effort=$EFFORT / timeout=${TIMEOUT}s"
+  gy=$(grep -cE '^(yolo|permission_mode)' ~/.grok/config.toml 2>/dev/null | head -1); gy="${gy:-0}"
+  [[ "$gy" -gt 0 ]] && echo "note:          ~/.grok/config.toml sets yolo/permission_mode; ccx overrides these per run."
+  mc=$(grep -cE '^\[mcp_servers' ~/.grok/config.toml 2>/dev/null | head -1); mc="${mc:-0}"
+  [[ "$mc" -gt 0 ]] && echo "note:          $mc MCP server(s) configured; ccx denies them by default (--mcp to allow)."
+  exit 0
+fi
+
+if [[ "$SUB" == "ls" ]]; then
+  [[ -d "$CCX_HOME/runs" ]] || { echo "no runs yet"; exit 0; }
+  for d in $(ls -1t "$CCX_HOME/runs" 2>/dev/null | head -"$LSN"); do
+    m="$CCX_HOME/runs/$d/meta.json"
+    if [[ -f "$m" ]]; then
+      jq -r --arg d "$d" '"\($d)  \(.status // "?")  turns=\(.turns // "?")  $\(.cost // 0)  \(.session // "-")"' "$m"
+    else echo "$d  (incomplete)"; fi
+  done
+  exit 0
+fi
+
+if [[ "$SUB" == "show" ]]; then
+  RUN="${BRIEF// /}"; [[ -n "$RUN" ]] || die "usage: ccx show <run-id>"
+  D="$CCX_HOME/runs/$RUN"; [[ -d "$D" ]] || die "no such run: $RUN"
+  case "$SHOW_WHAT" in
+    transcript)
+      src="$D/raw1.json"; [[ -f "$src" ]] || src="$D/raw.json"
+      jq -r '"--- reasoning ---\n" + (.thought // "(none captured)") +
+             "\n\n--- final text ---\n" + (.text // "(none)")' "$src"
+      echo; echo "note: ccx stores the worker's reasoning and final text, not its tool calls."
+      echo "      the full tool loop lives in ~/.grok/sessions/, keyed by cwd and session id."
+      jq -r '"      session: " + (.session // "-")' "$D/meta.json" 2>/dev/null ;;
+    meta)       cat "$D/meta.json" ;;
+    *)          cat "$D/envelope.json" 2>/dev/null || jq -r '.text' "$D/raw.json" ;;
+  esac
+  exit 0
+fi
+
+[[ "$SUB" == "run" || "$SUB" == "cont" ]] || die "unknown subcommand: $SUB"
+[[ -x "$GROK_BIN" ]] || die "grok CLI not found (set GROK_BIN)"
+have jq || die "jq is required"
+GROK_VER="$("$GROK_BIN" --version 2>/dev/null | awk '{print $2}')"
+if [[ "$USE_SCHEMA" -eq 1 ]] && ! "$GROK_BIN" --help 2>&1 | grep -q -- '--json-schema'; then
+  die "this grok build ($GROK_VER) has no --json-schema; use --no-schema or pin an older grok"
+fi
+[[ "$SUB" == "cont" && -z "$SESSION" ]] && die "ccx cont requires --session <uuid>"
+
+# A worktree exists to contain writes; asking for read as well is a contradiction, and
+# silently resolving it either way produced a worker with the wrong powers.
+if [[ -n "$WORKTREE" ]]; then
+  [[ "$PROFILE_SET" -eq 1 && "$PROFILE" == "read" ]] &&
+    die "--read and --worktree conflict (a worktree is for writes). Choose one."
+  PROFILE=write
+fi
+
+# Resuming a session under a different sandbox than it was created with is refused by
+# grok, and resuming a worktree run from $PWD would write to the main checkout.
+if [[ "$SUB" == "cont" ]]; then
+  PARENT="$(grep -l -- "$SESSION" "$CCX_HOME"/runs/*/meta.json 2>/dev/null | tail -1)"
+  if [[ -n "$PARENT" ]]; then
+    [[ "$PROFILE_SET" -eq 0 ]] && PROFILE="$(jq -r '.profile // "read"' "$PARENT")"
+    [[ "$CWD_SET" -eq 0 ]] && { pc="$(jq -r '.cwd // empty' "$PARENT")"; [[ -d "$pc" ]] && CWD="$pc"; }
+  elif [[ "$PROFILE_SET" -eq 0 ]]; then
+    echo "ccx: warning: no local record of session $SESSION; assuming --read profile and cwd $PWD" >&2
+  fi
+fi
+
+# ---------- brief ----------
+if [[ -n "$TASK_FILE" ]]; then
+  if [[ "$TASK_FILE" == "-" ]]; then BRIEF="$(cat)"; else
+    [[ -f "$TASK_FILE" ]] || die "no such task file: $TASK_FILE"; BRIEF="$(cat "$TASK_FILE")"; fi
+fi
+[[ -n "${BRIEF// /}" ]] || die "empty brief (use --task FILE, '-' for stdin, or -- <text>)"
+
+# --check is implemented in the brief, not as a CLI flag: grok removed --check in 1.0.x.
+if [[ "$CHECK" -eq 1 ]]; then
+  BRIEF="$BRIEF
+
+SELF-VERIFICATION (required before you return):
+re-read every file you changed, re-run the acceptance command, and state the real
+result in evidence[]. If verification fails and you cannot fix it, return status=\"partial\"."
+fi
+
+# ---------- worktree ----------
+if [[ -n "$WORKTREE" ]]; then
+  have git || die "git required for --worktree"
+  case "$WORKTREE" in *[!A-Za-z0-9._-]*|""|.|..)
+    die "--worktree name must match [A-Za-z0-9._-]+ (got: $WORKTREE)" ;; esac
+  REPO="$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)" || die "--worktree needs a git repo at $CWD"
+  WT="$CCX_HOME/worktrees/$(basename "$REPO")-$WORKTREE"
+  if [[ -d "$WT" ]]; then
+    # A pre-existing directory that is not our worktree would silently become the
+    # write target, defeating the isolation the flag promises.
+    git -C "$WT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+      || die "$WT exists but is not a git worktree; remove it or pick another name"
+    [[ "$(git -C "$WT" rev-parse --git-common-dir 2>/dev/null)" \
+       -ef "$(git -C "$REPO" rev-parse --git-common-dir 2>/dev/null)" ]] \
+      || die "$WT is a worktree of a different repository"
+  else
+    mkdir -p "$(dirname "$WT")"
+    git -C "$REPO" worktree add -b "ccx/$WORKTREE" "$WT" "$REF" >/dev/null 2>&1 \
+      || git -C "$REPO" worktree add "$WT" "$REF" >/dev/null \
+      || die "could not create worktree $WT"
+  fi
+  CWD="$WT"
+fi
+[[ -d "$CWD" ]] || die "no such directory: $CWD"
+CWD="$(cd "$CWD" && pwd)"
+
+if [[ "$PROFILE" == "read" ]]; then
+  case "$CWD/" in
+    /tmp/*|/private/tmp/*|/var/tmp/*|/private/var/folders/*|"${TMPDIR:-/nonexistent-tmpdir}"*)
+      die "--read cwd is on a path every sandbox profile leaves writable ($CWD).
+     The read-only guarantee does not hold there. Use a cwd outside temp, or --write." ;;
+  esac
+fi
+
+# ---------- profile ----------
+declare -a ARGS=()
+if [[ "$PROFILE" == "write" ]]; then
+  SANDBOX=workspace
+  ARGS+=(--sandbox "$SANDBOX" --permission-mode acceptEdits --allow "Bash")
+  ARGS+=(--deny "Bash(sudo*)" --deny "Bash(rm -rf /*)" --deny "Bash(git push*)"
+         --deny "Bash(git reset --hard*)" --deny "Bash(gh*)" --deny "Bash(npm publish*)"
+         --deny "Edit(**/.env*)" --deny "Write(**/.env*)")
+  : "${MAX_TURNS:=60}"
+else
+  # read-only is enforced by the kernel, so permissions can be permissive:
+  # the worker gets the full toolset (incl. shell) and simply cannot write.
+  SANDBOX=read-only
+  ARGS+=(--sandbox "$SANDBOX" --permission-mode bypassPermissions)
+  : "${MAX_TURNS:=30}"
+fi
+[[ -n "$TOOLS" ]] && ARGS+=(--tools "$TOOLS")
+ARGS+=(--disallowed-tools "Agent")
+[[ "$WEB" -eq 0 ]] && ARGS+=(--disable-web-search)
+# MCP servers are separate processes OUTSIDE the kernel sandbox, so a "read-only"
+# worker could still perform remote writes through them (e.g. signoz_delete_alert).
+[[ "$MCP" -eq 0 ]] && ARGS+=(--deny "MCPTool(*)")
+for r in ${XALLOW+"${XALLOW[@]}"}; do ARGS+=(--allow "$r"); done
+for r in ${XDENY+"${XDENY[@]}"};  do ARGS+=(--deny  "$r"); done
+
+SCHEMA=""
+if [[ "$USE_SCHEMA" -eq 1 ]]; then
+  if [[ -n "$SCHEMA_FILE" ]]; then
+    [[ -f "$SCHEMA_FILE" ]] || die "no such schema: $SCHEMA_FILE"
+    SCHEMA="$(cat "$SCHEMA_FILE")"
+  else SCHEMA="$DEFAULT_SCHEMA"; fi
+  jq -e . >/dev/null 2>&1 <<<"$SCHEMA" || die "schema is not valid JSON"
+  # Two-phase by default. Constrained decoding competes with the tool loop: the model
+  # can emit a schema-shaped answer on turn 1 *instead of* calling any tools, and it
+  # does so nondeterministically -- an empty result that looks like a clean success.
+  # So phase 1 runs free-form, and phase 2 resumes the same session purely to format.
+  [[ "$SCHEMA_INLINE" -eq 1 ]] && ARGS+=(--json-schema "$SCHEMA")
+fi
+if [[ -n "$SESSION" ]]; then
+  ARGS+=(--resume "$SESSION"); PRESET_SID="$SESSION"
+else
+  # We choose the UUID up front rather than learning it from the worker's output:
+  # on timeout there IS no output, and an unaddressable session means the work is lost.
+  PRESET_SID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+  ARGS+=(-s "$PRESET_SID")
+fi
+
+# ---------- run dir ----------
+slug="$(printf '%s' "${LABEL:-$SUB}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//;s/-*$//' | cut -c1-32)"
+RUN_ID="$(date +%Y%m%d-%H%M%S)-${slug:-task}-$$"
+D="$CCX_HOME/runs/$RUN_ID"; mkdir -p "$D"
+printf '%s\n' "$BRIEF" > "$D/brief.md"
+
+# ---------- dispatch ----------
+START=$(date +%s)
+set +e
+timeout --kill-after=30s "$TIMEOUT" "$GROK_BIN" --no-auto-update \
+  -p "$BRIEF" --cwd "$CWD" -m "$MODEL" --reasoning-effort "$EFFORT" \
+  --rules "$WORKER_RULES" --max-turns "$MAX_TURNS" \
+  --output-format json "${ARGS[@]}" >"$D/raw.json" 2>"$D/stderr.log"
+RC=$?
+set -e
+ELAPSED=$(( $(date +%s) - START ))
+
+if [[ $RC -eq 124 || $RC -eq 137 ]]; then
+  jq -n --arg r "$RUN_ID" --arg t "$TIMEOUT" --arg s "$PRESET_SID" --arg cwd "$CWD" \
+    '{run:$r,status:"timeout",session:$s,cwd:$cwd,
+      note:("worker exceeded " + $t + "s; its context is intact -- resume it")}' > "$D/meta.json"
+  cat "$D/meta.json"
+  cat >&2 <<EOM
+ccx: worker hit the ${TIMEOUT}s limit. The work is NOT lost -- the session still holds it:
+  ccx cont --session $PRESET_SID -- "Stop investigating. Report what you have found so far."
+Or re-run with a longer budget: --timeout $((TIMEOUT * 2))
+EOM
+  exit 4
+fi
+
+if ! jq -e . >/dev/null 2>&1 <"$D/raw.json"; then
+  echo "ccx: worker produced no parseable JSON (exit $RC). stderr:" >&2
+  tail -20 "$D/stderr.log" >&2; exit 5
+fi
+
+SID=$(jq -r '.sessionId // ""' "$D/raw.json"); SID="${SID:-$PRESET_SID}"
+COST=$(jq -r '.total_cost_usd // 0' "$D/raw.json")
+TURNS=$(jq -r '.num_turns // 0' "$D/raw.json")
+STOP=$(jq -r '.stopReason // "?"' "$D/raw.json")
+
+# ---------- phase 2: format the finished work into the envelope ----------
+if [[ "$USE_SCHEMA" -eq 1 && "$SCHEMA_INLINE" -eq 0 && -n "$SID" ]]; then
+  mv "$D/raw.json" "$D/raw1.json"
+  declare -a P2=()
+  [[ "$MCP" -eq 0 ]] && P2+=(--deny "MCPTool(*)")
+  set +e
+  timeout --kill-after=15s 180 "$GROK_BIN" --no-auto-update \
+    -p "Now return the result of the work you just did as JSON matching the required schema. Base it ENTIRELY on what you already found; do not investigate further and do not use any tools. If you did not actually complete the work, say so honestly with status=partial or blocked rather than returning an empty result." \
+    --cwd "$CWD" -m "$MODEL" --reasoning-effort low --resume "$SID" \
+    --sandbox "$SANDBOX" --disable-web-search ${P2+"${P2[@]}"} \
+    --max-turns 1 --json-schema "$SCHEMA" --output-format json \
+    >"$D/raw2.json" 2>>"$D/stderr.log"
+  RC2=$?
+  set -e
+  if [[ $RC2 -eq 0 ]] && jq -e '.structuredOutput' >/dev/null 2>&1 <"$D/raw2.json"; then
+    C2=$(jq -r '.total_cost_usd // 0' "$D/raw2.json")
+    COST=$(python3 -c "print(round($COST + $C2, 8))" 2>/dev/null || echo "$COST")
+    jq -s '.[0] * {structuredOutput: .[1].structuredOutput}' "$D/raw1.json" "$D/raw2.json" > "$D/raw.json"
+  else
+    echo "ccx: warning: envelope formatting pass failed; falling back to prose" >&2
+    cp "$D/raw1.json" "$D/raw.json"
+  fi
+fi
+
+if [[ "$USE_SCHEMA" -eq 1 ]] && jq -e '.structuredOutput' >/dev/null 2>&1 <"$D/raw.json"; then
+  jq '.structuredOutput' "$D/raw.json" > "$D/envelope.json"
+  STATUS=$(jq -r '.status // "done"' "$D/envelope.json")
+else
+  jq -r '.text // ""' "$D/raw.json" > "$D/envelope.json"; STATUS="$STOP"
+fi
+
+jq -n --arg r "$RUN_ID" --arg s "$SID" --arg st "$STATUS" --arg c "$COST" \
+      --arg t "$TURNS" --arg e "$ELAPSED" --arg cwd "$CWD" --arg m "$MODEL" --arg ef "$EFFORT" \
+      --arg gv "$GROK_VER" --arg p "$PROFILE" \
+  '{run:$r,session:$s,status:$st,cost:($c|tonumber),turns:($t|tonumber),
+    seconds:($e|tonumber),cwd:$cwd,model:$m,effort:$ef,profile:$p,grok:$gv}' > "$D/meta.json"
+
+# ---------- report (small!) ----------
+if [[ "$RAW" -eq 0 ]]; then
+  printf 'run %s | session %s | %s turns | %ss | $%s\n' "$RUN_ID" "${SID:0:8}" "$TURNS" "$ELAPSED" "$COST"
+  printf 'cwd %s\n' "$CWD"
+  printf 'full transcript: ccx show %s --transcript\n' "$RUN_ID"
+  [[ -n "$SID" ]] && printf 'continue:        ccx cont --session %s -- "<followup>"\n' "$SID"
+  printf -- '---\n'
+fi
+
+if [[ "$TURNS" -le 1 && "$ELAPSED" -lt 20 ]]; then
+  echo "ccx: warning: worker finished in $TURNS turn / ${ELAPSED}s -- it may not have used any tools. Check: ccx show $RUN_ID --transcript" >&2
+fi
+
+SZ=$(wc -c < "$D/envelope.json" | tr -d ' ')
+if [[ "$SZ" -gt "$MAX_OUT" ]]; then
+  head -c "$MAX_OUT" "$D/envelope.json"
+  printf '\n... [truncated %s bytes; full: %s/envelope.json]\n' "$((SZ-MAX_OUT))" "$D"
+else
+  cat "$D/envelope.json"; echo
+fi
+
+case "$STATUS" in blocked) exit 3 ;; *) exit 0 ;; esac

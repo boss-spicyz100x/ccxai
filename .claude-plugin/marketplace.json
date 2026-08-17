@@ -1,0 +1,11 @@
+{
+  "name": "ccxai",
+  "owner": { "name": "spicyz" },
+  "plugins": [
+    {
+      "name": "ccx",
+      "source": "./plugins/ccx",
+      "description": "Delegate scoped engineering tasks to a Grok 4.6 worker (orchestrator-worker) using your grok.com subscription."
+    }
+  ]
+}
