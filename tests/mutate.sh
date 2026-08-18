@@ -78,6 +78,22 @@ RC=$?'
 "fanout-signal-cascade-dropped" "recovery.sh"
 "  trap '_fanout_signal TERM' TERM"
 '  :'
+
+"quota-classified-as-parse-error" "quota.sh"
+'  if _looks_like_quota "$D/stderr.log"; then'
+'  if false; then'
+
+"quota-breaker-not-checked-before-dispatch" "quota.sh"
+'command -v timeout >/dev/null 2>&1 || die "timeout(1) not found -- install coreutils (brew install coreutils) or provide gtimeout"
+_breaker_check'
+'command -v timeout >/dev/null 2>&1 || die "timeout(1) not found -- install coreutils (brew install coreutils) or provide gtimeout"'
+
+"fanout-ignores-quota-breaker" "quota.sh"
+'    if [[ -f "$(_breaker_file)" ]]; then
+      SKIPPED+=("$slug")
+      continue
+    fi'
+'    :'
 )
 
 printf '%-38s %-18s %s\n' MUTATION GUARDIAN RESULT

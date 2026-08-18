@@ -44,6 +44,17 @@ Do not "simplify" these away. Every one was found by using the tool, not by read
   (`doctor` dying on a normal config, `cont` exiting 2 with no output and its graceful
   unknown-session path unreachable, and `fanout` truncating its summary and total). Any such
   substitution needs `|| true` and an explicit empty check.
+- **A quota/auth refusal is exit 6, not exit 5, and it arms a breaker.** An exhausted
+  subscription looks exactly like a crash — grok exits non-zero with no JSON — so it used to
+  surface as "worker produced no parseable JSON". An orchestrator cannot tell those apart, so
+  it retries, and `fanout` dispatched every remaining brief into the same wall. A refusal now
+  writes `$CCX_HOME/.quota-block`; the next `ccx run` refuses before dispatching, `fanout`
+  stops and reports the briefs it skipped, and `ccx doctor` clears the block once auth answers
+  normally. The block expires on its own (`CCX_BREAKER_TTL`, default 900s).
+  **The detection patterns are NOT verified against a real exhausted subscription** — that
+  cannot be provoked on demand. They are a broad match over stderr, applied only to a dispatch
+  that already failed with no usable output, so a false positive costs one blocked run and
+  expires, and a false negative just restores the old behaviour.
 - **A run that ends early is still logged.** Timeout (`exit 4`) and unparseable-response
   (`exit 5`) wrote `meta.json` and then returned without appending to `runs.jsonl`, while
   `ccx stats` filters failures on exactly those statuses — so the failure report was
@@ -93,7 +104,7 @@ for t in tests/*.sh; do [[ "$t" == */mutate.sh ]] && continue; "$t" || echo "FAI
 tests/mutate.sh          # slower; run it after any change to ccx or to a test
 ```
 
-Eight files, 86 assertions, all using a stub `GROK_BIN` and a throwaway `CCX_HOME` —
+Nine files, 97 assertions, all using a stub `GROK_BIN` and a throwaway `CCX_HOME` —
 no test dispatches a real worker or spends money.
 
 **A test here is only finished when it fails on the bug it guards.** `tests/mutate.sh`
