@@ -38,9 +38,19 @@ _md5() { if have md5sum; then md5sum | cut -d' ' -f1; else md5 -q; fi; }
 # write never happens and meta.json stays "running" forever while the detached worker often
 # finishes and bills. Repair those records from whatever the worker actually left on disk.
 _reconcile() {
-  local d m age budget src c now
-  mkdir "$CCX_HOME/.reconcile.lock" 2>/dev/null || return 0   # another pass is running
-  trap 'rmdir "$CCX_HOME/.reconcile.lock" 2>/dev/null || true' RETURN
+  local d m age budget src c now lockage
+  # A pass killed by a signal never runs its RETURN trap, so the lock dir it made
+  # outlives it and every later pass hits `mkdir || return 0` and gives up --
+  # crash repair silently disabled for good. Break a demonstrably stale lock, but
+  # still respect a fresh one so two passes cannot race.
+  if ! mkdir "$CCX_HOME/.reconcile.lock" 2>/dev/null; then
+    lockage=$(( $(date +%s) - $(_mtime "$CCX_HOME/.reconcile.lock") ))
+    (( lockage > 900 )) || return 0
+    rmdir "$CCX_HOME/.reconcile.lock" 2>/dev/null || true
+    mkdir "$CCX_HOME/.reconcile.lock" 2>/dev/null || return 0
+  fi
+  trap 'rmdir "$CCX_HOME/.reconcile.lock" 2>/dev/null || true; trap - INT TERM' RETURN
+  trap 'rmdir "$CCX_HOME/.reconcile.lock" 2>/dev/null || true; exit 130' INT TERM
   [[ -d "$CCX_HOME/runs" ]] || return 0
   now=$(date +%s)
   for d in "$CCX_HOME"/runs/*/; do
@@ -92,6 +102,54 @@ _log_run() {
           brief_bytes:(.brief_bytes // 0),exit_code:(.exit_code // 0),
           warnings:(.warnings // []),grok:(.grok // "?"),cwd}' "$m" \
     >> "$CCX_HOME/runs.jsonl" 2>/dev/null || true
+}
+
+# A run that ends before the normal post-dispatch write -- timeout, unparseable
+# response -- still burned budget and still holds a resumable session. Give it the
+# same record shape a completed run gets, and LOG it: these statuses reached
+# meta.json but were never appended to runs.jsonl, so `ccx stats`, which filters
+# failures on exactly these statuses, could never surface a single one.
+_terminal_meta() {
+  local st="$1" xc="$2" warn="$3"
+  jq -n --arg r "$RUN_ID" --arg s "$PRESET_SID" --arg st "$st" --arg cwd "$CWD" \
+        --arg m "$MODEL" --arg ef "$EFFORT" --arg gv "${GROK_VER:-?}" --arg p "$PROFILE" \
+        --arg lb "${LABEL:-$SUB}" --arg sub "$SUB" --arg e "${ELAPSED:-0}" \
+        --arg xc "$xc" --arg t "${TIMEOUT:-0}" --arg w "$warn" \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{ts:$ts,run:$r,session:$s,sub:$sub,label:$lb,status:$st,stop_reason:$st,
+      cost:0,turns:0,seconds:($e|tonumber),
+      phase1_seconds:($e|tonumber),phase2_seconds:0,
+      brief_bytes:0,exit_code:($xc|tonumber),timeout_s:($t|tonumber),
+      cwd:$cwd,model:$m,effort:$ef,profile:$p,grok:$gv,warnings:[$w],cmd:[]}' > "$D/meta.json"
+  _log_run "$D/meta.json"
+}
+
+# An external signal used to be unreportable: bash does not service traps while a
+# foreground child runs, so a SIGTERM during dispatch was handled only after the
+# worker finished -- never. ccx died, the worker kept running and kept BILLING,
+# meta.json stayed "running", and nothing reached runs.jsonl. `ccx stats` filters
+# failures on a "killed" status that nothing ever wrote.
+# The dispatch runs in the background and is waited on, so this handler fires.
+_on_signal() {
+  local sig="$1" i
+  trap - INT TERM
+  if [[ -n "${WORKER_PID:-}" ]]; then
+    kill -TERM "$WORKER_PID" 2>/dev/null || true
+    # timeout(1) forwards TERM to grok; give that a moment, then insist
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$WORKER_PID" 2>/dev/null || break
+      sleep 0.2
+    done
+    kill -KILL "$WORKER_PID" 2>/dev/null || true
+  fi
+  ELAPSED=$(( $(date +%s) - ${START:-$(date +%s)} ))
+  _terminal_meta killed "$([[ "$sig" == INT ]] && echo 130 || echo 143)" \
+    "dispatcher received SIG$sig; the worker was terminated"
+  {
+    echo "ccx: SIG$sig -- worker terminated. The work is NOT lost; the session holds it:"
+    echo "  ccx cont --session $PRESET_SID -- \"Report what you have so far.\""
+  } >&2
+  exit "$([[ "$sig" == INT ]] && echo 130 || echo 143)"
 }
 
 usage() {
@@ -242,9 +300,11 @@ if [[ "$SUB" == "doctor" ]]; then
     printf '%-14s %s\n' "$t:" "$(have "$t" && command -v "$t" || echo 'MISSING')"; done
   printf '%-14s %s\n' "runs:" "$CCX_HOME/runs"
   printf '%-14s %s\n' "defaults:" "$MODEL / effort=$EFFORT / timeout=${TIMEOUT}s"
-  gy=$(grep -cE '^(yolo|permission_mode)' ~/.grok/config.toml 2>/dev/null | head -1); gy="${gy:-0}"
+  # grep -c exits 1 on a zero count and 2 on a missing file; under pipefail either
+  # aborted doctor here, right before the two lines reporting the config's posture.
+  gy=$(grep -cE '^(yolo|permission_mode)' ~/.grok/config.toml 2>/dev/null || true); gy="${gy:-0}"
   [[ "$gy" -gt 0 ]] && echo "note:          ~/.grok/config.toml sets yolo/permission_mode; ccx overrides these per run."
-  mc=$(grep -cE '^\[mcp_servers' ~/.grok/config.toml 2>/dev/null | head -1); mc="${mc:-0}"
+  mc=$(grep -cE '^\[mcp_servers' ~/.grok/config.toml 2>/dev/null || true); mc="${mc:-0}"
   [[ "$mc" -gt 0 ]] && echo "note:          $mc MCP server(s) configured; ccx denies them by default (--mcp to allow)."
   exit 0
 fi
@@ -307,7 +367,7 @@ if [[ "$SUB" == "stats" ]]; then
     echo "recent failures / warnings:"
     jq -r --arg cut "$CUT" --arg lab "$LABF" '
       select(($cut == "" or .ts >= $cut) and ($lab == "" or (.label // "") == $lab))
-      | select((((.status // "") | test("blocked|timeout|killed")))
+      | select((((.status // "") | test("blocked|timeout|killed|error|abandoned")))
                or (((.warnings // []) | length) > 0))
       | "  \(.ts)  \(.run)  \(.status // "?")  \((.warnings // []) | join("; "))"' \
       "$L" | tail -8
@@ -461,6 +521,27 @@ if [[ "$SUB" == "fanout" ]]; then
     "$STAMP" "${#FILES[@]}" "$PROFILE" "$CONCURRENCY"
   printf 'results: %s\n\n' "$OUT"
 
+  # Interrupting fanout used to orphan every worker it had started: each one kept
+  # running and kept billing, N at a time. Signal the `ccx run` inside each
+  # subshell (pkill -P) so that child runs its OWN handler -- terminating its
+  # worker and recording the run as killed -- instead of vanishing untracked.
+  declare -a KIDS=()
+  _fanout_signal() {
+    local sig="$1" k
+    trap - INT TERM
+    echo "" >&2
+    echo "ccx: SIG$sig -- terminating ${#KIDS[@]} worker(s); each records its own session" >&2
+    for k in ${KIDS+"${KIDS[@]}"}; do
+      pkill -TERM -P "$k" 2>/dev/null || true
+      kill  -TERM "$k"    2>/dev/null || true
+    done
+    wait 2>/dev/null || true
+    echo "ccx: results so far are under $OUT" >&2
+    exit "$([[ "$sig" == INT ]] && echo 130 || echo 143)"
+  }
+  trap '_fanout_signal TERM' TERM
+  trap '_fanout_signal INT'  INT
+
   declare -a SLUGS=()
   for f in "${FILES[@]}"; do
     base="$(basename "$f")"; base="${base%.*}"
@@ -468,7 +549,7 @@ if [[ "$SUB" == "fanout" ]]; then
     [[ -n "$slug" ]] || slug="brief$(( ${#SLUGS[@]} + 1 ))"
     # worktree names must be unique; a collision would put two writers in one tree
     n=1; try="$slug"
-    while printf '%s\n' ${SLUGS+"${SLUGS[@]}"} | grep -qx "$try"; do n=$((n+1)); try="$slug-$n"; done
+    while printf '%s\n' ${SLUGS+"${SLUGS[@]}"} | grep -qxF "$try"; do n=$((n+1)); try="$slug-$n"; done
     slug="$try"; SLUGS+=("$slug")
 
     # a write worker gets its own worktree; a read worker cannot write, so it shares cwd
@@ -480,6 +561,7 @@ if [[ "$SUB" == "fanout" ]]; then
       "$0" run "${FWD[@]}" ${ISO+"${ISO[@]}"} --label "$slug" --task "$f" \
         >"$OUT/$slug.json" 2>"$OUT/$slug.err"
       printf '%s %s\n' "$?" "$slug" >> "$OUT/exits" ) &
+    KIDS+=("$!")
     printf '  dispatched %s\n' "$slug"
   done
   wait
@@ -488,6 +570,7 @@ if [[ "$SUB" == "fanout" ]]; then
   mv "$OUT/exits.tmp" "$OUT/exits"
   echo; printf '%-24s %-9s %6s %8s %7s\n' BRIEF STATUS TURNS COST SECONDS
   rc=0
+  declare -a METAS=()
   for slug in "${SLUGS[@]}"; do
     ex=$(awk -v s="$slug" '$2==s{print $1; exit}' "$OUT/exits" 2>/dev/null || true)
     env=$(sed -n '/^---$/,$p' "$OUT/$slug.json" 2>/dev/null | tail -n +2)
@@ -497,24 +580,29 @@ if [[ "$SUB" == "fanout" ]]; then
       # --no-schema returns prose, not an envelope: the exit code is the only verdict
       st=$([[ "$ex" == "0" ]] && echo "ok" || echo "failed")
     fi
-    md=$(ls -dt "$CCX_HOME"/runs/*-"$slug"-* 2>/dev/null | head -1)
-    printf '%-24s %-9s %6s %8s %7s\n' "${slug:0:24}" "$st" \
-      "$(jq -r '.turns // "-"' "$md/meta.json" 2>/dev/null)" \
-      "$(jq -r 'if .cost then "$" + (.cost*100|round/100|tostring) else "-" end' "$md/meta.json" 2>/dev/null)" \
-      "$(jq -r '.seconds // "-"' "$md/meta.json" 2>/dev/null)"
+    # Attribute by the run id the child printed. Globbing runs/*-<slug>-* matched
+    # every run that ever used this brief name: a worker that died before creating
+    # its run dir inherited an OLDER run's turns/cost/seconds, and that stale cost
+    # was folded into the fanout total. The glob also bound alpha to alpha-2's meta.
+    rid=$(sed -n '1s/^run \([^ |]*\).*/\1/p' "$OUT/$slug.json" 2>/dev/null || true)
+    [[ -n "$rid" ]] || rid=$(jq -r '.run // empty' "$OUT/$slug.json" 2>/dev/null || true)
+    md=""; [[ -n "$rid" && -f "$CCX_HOME/runs/$rid/meta.json" ]] && md="$CCX_HOME/runs/$rid"
+    if [[ -n "$md" ]]; then
+      METAS+=("$md/meta.json")
+      f_turns=$(jq -r '.turns // "-"' "$md/meta.json" 2>/dev/null || echo -)
+      f_cost=$(jq -r 'if (.cost|type)=="number" then "$" + (.cost*100|round/100|tostring) else "-" end' "$md/meta.json" 2>/dev/null || echo -)
+      f_secs=$(jq -r '.seconds // "-"' "$md/meta.json" 2>/dev/null || echo -)
+    else
+      f_turns="-"; f_cost="-"; f_secs="-"
+    fi
+    printf '%-24s %-9s %6s %8s %7s\n' "${slug:0:24}" "$st" "$f_turns" "$f_cost" "$f_secs"
     if [[ "$USE_SCHEMA" -eq 1 ]]; then
       [[ "$ex" == "0" && "$st" == "done" ]] || rc=1
     else
       [[ "$ex" == "0" ]] || rc=1
     fi
   done
-  # Collect paths into an array: unquoted command substitution here would split a
-  # CCX_HOME containing a space into bogus file arguments.
-  declare -a METAS=()
-  for s in "${SLUGS[@]}"; do
-    mf=$(ls -dt "$CCX_HOME"/runs/*-"$s"-*/meta.json 2>/dev/null | head -1 || true)
-    [[ -n "$mf" ]] && METAS+=("$mf")
-  done
+  # METAS was filled above, from the run ids the children reported.
   if (( ${#METAS[@]} )); then
     tot=$(jq -s 'map(.cost // 0)|add' "${METAS[@]}" 2>/dev/null || echo 0)
   else tot=0; fi
@@ -553,6 +641,9 @@ fi
 
 [[ "$SUB" == "run" || "$SUB" == "cont" ]] || die "unknown subcommand: $SUB"
 [[ -x "$GROK_BIN" ]] || die "grok CLI not found (set GROK_BIN)"
+# doctor lists timeout, but run silently depended on it: without it every dispatch
+# died at exit 127 and left meta.json status=running. Stock macOS ships no timeout.
+command -v timeout >/dev/null 2>&1 || die "timeout(1) not found -- install coreutils (brew install coreutils) or provide gtimeout"
 have jq || die "jq is required"
 GROK_VER="$("$GROK_BIN" --version 2>/dev/null | awk '{print $2}')"
 if [[ "$USE_SCHEMA" -eq 1 ]] && ! "$GROK_BIN" --help 2>&1 | grep -q -- '--json-schema'; then
@@ -579,7 +670,10 @@ fi
 # Resuming a session under a different sandbox than it was created with is refused by
 # grok, and resuming a worktree run from $PWD would write to the main checkout.
 if [[ "$SUB" == "cont" ]]; then
-  PARENT="$(grep -l -- "$SESSION" "$CCX_HOME"/runs/*/meta.json 2>/dev/null | tail -1)"
+  # No match is the normal "ccx has no record of this session" case, handled by the
+  # warning branch below. Without `|| true`, pipefail exited 2 with no output and
+  # that graceful path was unreachable.
+  PARENT="$(grep -l -- "$SESSION" "$CCX_HOME"/runs/*/meta.json 2>/dev/null | tail -1 || true)"
   if [[ -n "$PARENT" ]]; then
     [[ "$PROFILE_SET" -eq 0 ]] && PROFILE="$(jq -r '.profile // "read"' "$PARENT")"
     [[ "$CWD_SET" -eq 0 ]] && { pc="$(jq -r '.cwd // empty' "$PARENT")"; [[ -d "$pc" ]] && CWD="$pc"; }
@@ -636,7 +730,10 @@ CWD="$(cd "$CWD" && pwd)"
 
 if [[ "$PROFILE" == "read" ]]; then
   case "$CWD/" in
-    /tmp/*|/private/tmp/*|/var/tmp/*|/private/var/folders/*|"${TMPDIR:-/nonexistent-tmpdir}"*)
+    # /var/folders is where macOS puts TMPDIR. It was matched only through the
+    # $TMPDIR pattern, so any context that does not export TMPDIR (cron, launchd,
+    # env -u TMPDIR) slipped a --read cwd past this guard.
+    /tmp/*|/private/tmp/*|/var/tmp/*|/var/folders/*|/private/var/folders/*|"${TMPDIR:-/nonexistent-tmpdir}"*)
       die "--read cwd is on a path every sandbox profile leaves writable ($CWD).
      The read-only guarantee does not hold there. Use a cwd outside temp, or --write." ;;
   esac
@@ -726,21 +823,27 @@ CMD_JSON=$(printf '%s\n' "${ARGS[@]}" \
 
 # ---------- dispatch ----------
 START=$(date +%s)
+trap '_on_signal TERM' TERM
+trap '_on_signal INT'  INT
 set +e
+# Backgrounded and waited on deliberately: bash defers trap handling until a
+# FOREGROUND child exits, which would make the handler above useless.
 timeout --kill-after=30s "$TIMEOUT" "$GROK_BIN" --no-auto-update \
   -p "$BRIEF" --cwd "$CWD" -m "$MODEL" --reasoning-effort "$EFFORT" \
   --rules "$WORKER_RULES" --max-turns "$MAX_TURNS" \
-  --output-format json "${ARGS[@]}" >"$D/raw.json" 2>"$D/stderr.log"
+  --output-format json "${ARGS[@]}" >"$D/raw.json" 2>"$D/stderr.log" &
+WORKER_PID=$!
+wait "$WORKER_PID"
 RC=$?
+WORKER_PID=""
 set -e
+trap - INT TERM
 ELAPSED=$(( $(date +%s) - START ))
 P1_SECONDS=$ELAPSED
 P2_SECONDS=0
 
 if [[ $RC -eq 124 || $RC -eq 137 ]]; then
-  jq -n --arg r "$RUN_ID" --arg t "$TIMEOUT" --arg s "$PRESET_SID" --arg cwd "$CWD" \
-    '{run:$r,status:"timeout",session:$s,cwd:$cwd,
-      note:("worker exceeded " + $t + "s; its context is intact -- resume it")}' > "$D/meta.json"
+  _terminal_meta timeout "$RC" "worker exceeded ${TIMEOUT}s; the session still holds the work"
   cat "$D/meta.json"
   cat >&2 <<EOM
 ccx: worker hit the ${TIMEOUT}s limit. The work is NOT lost -- the session still holds it:
@@ -751,12 +854,14 @@ EOM
 fi
 
 if ! jq -e . >/dev/null 2>&1 <"$D/raw.json"; then
+  _terminal_meta error "$RC" "worker produced no parseable JSON"
   echo "ccx: worker produced no parseable JSON (exit $RC). stderr:" >&2
   tail -20 "$D/stderr.log" >&2; exit 5
 fi
 
 SID=$(jq -r '.sessionId // ""' "$D/raw.json"); SID="${SID:-$PRESET_SID}"
-COST=$(jq -r '.total_cost_usd // 0' "$D/raw.json")
+# Coerce to a number: a string here also breaks jq arithmetic downstream.
+COST=$(jq -r '(.total_cost_usd // 0) | if type=="number" then . else 0 end' "$D/raw.json")
 TURNS=$(jq -r '.num_turns // 0' "$D/raw.json")
 STOP=$(jq -r '.stopReason // "?"' "$D/raw.json")
 
@@ -776,7 +881,9 @@ if [[ "$USE_SCHEMA" -eq 1 && "$SCHEMA_INLINE" -eq 0 && -n "$SID" ]]; then
   [[ $RC2 -ne 0 ]] && WARN+=("phase2-format-failed")
   if [[ $RC2 -eq 0 ]] && jq -e '.structuredOutput' >/dev/null 2>&1 <"$D/raw2.json"; then
     C2=$(jq -r '.total_cost_usd // 0' "$D/raw2.json")
-    COST=$(python3 -c "print(round($COST + $C2, 8))" 2>/dev/null || echo "$COST")
+    # awk -v binds these as DATA. Both come from the worker's own JSON, and
+  # interpolating them into `python3 -c` let worker output execute code here.
+  COST=$(awk -v a="$COST" -v b="$C2" 'BEGIN{printf "%.8f", (a+0)+(b+0)}' 2>/dev/null || echo "$COST")
     jq -s '.[0] * {structuredOutput: .[1].structuredOutput}' "$D/raw1.json" "$D/raw2.json" > "$D/raw.json"
   else
     echo "ccx: warning: envelope formatting pass failed; falling back to prose" >&2

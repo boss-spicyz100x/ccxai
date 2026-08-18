@@ -111,6 +111,21 @@ refuse "read-cwd-under-tmp" \
   "every sandbox profile leaves writable" \
   run --read --cwd "$TMPCWD" -- x
 
+# macOS puts TMPDIR under /var/folders. The pattern list matched that path only
+# through the $TMPDIR pattern, so any context that does not export TMPDIR --
+# cron, launchd, `env -u TMPDIR` -- accepted a --read cwd on a directory every
+# sandbox profile leaves writable. /private/var/folders was listed; the
+# unresolved /var/folders that TMPDIR actually names was not.
+if [[ -d /var/folders ]]; then
+  VARFOLDERS_CWD=$(TMPDIR=${TMPDIR:-/var/folders} mktemp -d 2>/dev/null || echo "")
+  if [[ -n "$VARFOLDERS_CWD" && "$VARFOLDERS_CWD" == /var/folders/* ]]; then
+    refuse "read-cwd-var-folders-no-tmpdir" \
+      "every sandbox profile leaves writable" \
+      env -u TMPDIR "$CCX" run --read --cwd "$VARFOLDERS_CWD" -- x
+    rm -rf "$VARFOLDERS_CWD"
+  fi
+fi
+
 refuse "run-with-session" \
   "--session resumes an existing worker" \
   run --session 11111111-2222-3333-4444-555555555555 -- x

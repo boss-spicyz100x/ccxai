@@ -83,4 +83,39 @@ if CCX_HOME="$T/h3" GROK_BIN="$T/grok-bad" "$CCX" fanout --cwd "$ROOT" \
   no "failing workers must make fanout exit non-zero"
 else ok "failing workers make fanout exit non-zero"; fi
 
+# --- a worker that never created a run dir must not inherit an older run's
+# --- numbers. fanout located each worker's run by globbing runs/*-<slug>-*
+# --- across ALL history, so a stale run with the same brief name was reported
+# --- as this run's turns/cost/seconds and folded into the fanout total.
+H4="$T/h4"; mkdir -p "$H4/runs/20260101-000000-alpha-9999"
+cat > "$H4/runs/20260101-000000-alpha-9999/meta.json" <<'STALE'
+{"run":"20260101-000000-alpha-9999","session":"deadbeef-0000-0000-0000-000000000000",
+ "status":"done","turns":42,"cost":99.99,"seconds":4242,"profile":"read"}
+STALE
+# GROK_BIN missing makes each child die at the `grok CLI not found` check, which
+# runs BEFORE the run directory is created -- so this fanout produces no run of
+# its own and the only alpha-* run on disk is the stale one seeded above.
+AOUT=$(CCX_HOME="$H4" GROK_BIN="$T/nonexistent-grok" "$CCX" fanout --cwd "$ROOT" \
+         --briefs "$B" --read --concurrency 2 2>&1 || true)
+if grep -qE '(^|[^0-9])42($|[^0-9])' <<<"$AOUT" || grep -q '99\.99' <<<"$AOUT"; then
+  no "stale run must not be attributed to a worker that never ran"
+  printf '     reported: %s\n' "$(grep -E '^alpha' <<<"$AOUT" | head -1)"
+else ok "stale run must not be attributed to a worker that never ran"; fi
+
+# The total line must be PRESENT and must not contain the stale cost. Asserting
+# only "99.99 is absent" is a false pass: fanout used to die at the run-dir glob
+# (pipefail + set -e) so the total never printed at all, and absence looked green.
+if ! grep -qE '^total \$' <<<"$AOUT"; then
+  no "fanout must still print a total when a worker has no run dir"
+elif grep -qE '^total \$(99\.99|199\.98)' <<<"$AOUT"; then
+  no "stale cost must not enter the fanout total"
+else ok "fanout totals exclude the stale run"; fi
+
+# Every brief must get a summary row; a worker with no run dir used to abort the
+# whole loop, so later briefs silently vanished from the table.
+missing=""
+for want in alpha beta; do grep -qE "^$want " <<<"$AOUT" || missing="$missing $want"; done
+if [[ -n "$missing" ]]; then no "every brief must appear in the summary (missing:$missing)"
+else ok "every brief appears in the summary"; fi
+
 exit "$fail"
