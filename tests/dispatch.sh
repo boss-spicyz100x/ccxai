@@ -159,6 +159,17 @@ if expect_invoked "write-sandbox" "$L"; then
   fi
 fi
 
+# ---------- --permission-mode value on the write profile
+# acceptEdits silently CANCELS mutating bash: touch/mkdir/echo >f come back
+# stopReason=cancelled, 1 turn, empty output, exit 0. Nothing guarded this value
+# until a mutation run showed the regression survived the entire suite.
+if has_pair "$L" --permission-mode bypassPermissions; then
+  pass "write-permission-mode: bypassPermissions"
+else
+  got=$(invoc "$L" 1 | awk '$0=="--permission-mode"{getline; print; exit}')
+  fail "write-permission-mode: want bypassPermissions, got '${got:-<missing>}'"
+fi
+
 # ---------- --mcp drops the MCP deny (absence of that exact pattern)
 H="$T/h-mcp"; L="$T/l-mcp"
 run_ccx "$H" "$L" --read --mcp --no-schema -- "dispatch probe"
