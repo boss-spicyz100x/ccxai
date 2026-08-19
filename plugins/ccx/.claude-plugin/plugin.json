@@ -1,6 +1,8 @@
 {
   "name": "ccx",
   "description": "Delegate scoped engineering tasks from Claude Code to a Grok 4.6 worker (orchestrator-worker), using your grok.com subscription via the Grok Build CLI.",
-  "version": "0.1.0",
-  "author": { "name": "spicyz" }
+  "version": "0.2.0",
+  "author": {
+    "name": "spicyz"
+  }
 }

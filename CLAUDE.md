@@ -82,6 +82,14 @@ clones without credentials, the `gh` credential helper is configured repo-locall
 rather than globally, and `~/.config/git/config` is a nix store symlink so
 `gh auth setup-git` cannot write to it.
 
+**Bump `plugins/ccx/.claude-plugin/plugin.json` whenever the plugin changes.** The
+plugin cache is keyed by version (`~/.claude/plugins/cache/ccxai/ccx/<version>/`), so a
+loader that already has that version never re-fetches — no matter how far the repo has
+moved. This was found the hard way: after ten commits of security and recovery fixes the
+cache still held a 308-line `bin/ccx` from before any of them, with the sandbox bypass
+intact, because the version string never changed. The `~/.local/bin` symlink shadowed it,
+which is the only reason nothing ran the old code.
+
 `./install.sh` symlinks `plugins/ccx/bin/ccx` into `~/.local/bin`. Do not add the repo's
 `bin` directory to PATH: the Claude Code plugin loader already does that for its own
 sessions, which is exactly why `ccx` appeared to be installed while every normal shell
