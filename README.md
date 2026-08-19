@@ -31,9 +31,14 @@ sessions only** — every other shell still needs the full path to the script:
 
 ```bash
 # in Claude Code, for the /ccx:* skills and the grok-worker agent
-/plugin marketplace add ~/Documents/personal/research/ccxai
+/plugin marketplace add boss-spicyz100x/ccxai
 /plugin install ccx@ccxai
 ```
+
+The plugin is fetched from GitHub, so changes to the skills, agent and commands
+under `plugins/ccx/` take effect only after a push. The **dispatcher itself** is
+the `install.sh` symlink into `~/.local/bin`, which points at your working tree —
+so edits to `bin/ccx` are still live.
 
 `install.sh` links rather than copies, so edits to the repo are live; a stale copy
 on PATH is its own class of bug. It refuses to overwrite anything that is not a

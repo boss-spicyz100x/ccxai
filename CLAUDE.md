@@ -71,6 +71,17 @@ Do not "simplify" these away. Every one was found by using the tool, not by read
 
 ## Installing
 
+The plugin marketplace is the **public GitHub repo**, matching how the other
+marketplaces here are registered — no local path in `~/.claude/settings.json`.
+That means the skills, agent and commands come from `origin/main`: edit them and
+they do nothing until you push. The dispatcher does not have this problem —
+`install.sh` symlinks the working tree, so `bin/ccx` edits are live.
+
+A private repo will NOT work as a github marketplace on this machine: the loader
+clones without credentials, the `gh` credential helper is configured repo-locally
+rather than globally, and `~/.config/git/config` is a nix store symlink so
+`gh auth setup-git` cannot write to it.
+
 `./install.sh` symlinks `plugins/ccx/bin/ccx` into `~/.local/bin`. Do not add the repo's
 `bin` directory to PATH: the Claude Code plugin loader already does that for its own
 sessions, which is exactly why `ccx` appeared to be installed while every normal shell
