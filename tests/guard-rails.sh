@@ -111,6 +111,44 @@ refuse "read-cwd-under-tmp" \
   "every sandbox profile leaves writable" \
   run --read --cwd "$TMPCWD" -- x
 
+ok(){ echo "PASS $1"; }
+no(){ echo "FAIL $1"; fail=1; }
+
+# --- --dry-run: exercise every guard without paying for it ---------------------
+# The regression checks in CLAUDE.md pass a live brief (`-- x`), so a guard that
+# stopped refusing used to dispatch a REAL worker. Two runs cost $0.047 asking
+# what "x" meant before --dry-run existed. These assertions pin both halves: the
+# guards still fire under --dry-run, and a run that passes them dispatches nothing.
+: > "$LOG"
+DRYHOME="$T/dryhome"
+dry_out=$(CCX_HOME="$DRYHOME" "$CCX" run --read --cwd "$ROOT" --dry-run -- "probe" 2>&1); dry_rc=$?
+
+if [[ "$dry_rc" -eq 0 ]]; then ok "dry-run exits 0 on a valid invocation"
+else no "dry-run should exit 0 (got $dry_rc): $dry_out"; fi
+
+if [[ -s "$LOG" ]]; then no "dry-run must not invoke grok (argv log is non-empty)"
+else ok "dry-run does not invoke grok"; fi
+
+if [[ -d "$DRYHOME/runs" ]]; then no "dry-run must not create a run directory"
+else ok "dry-run leaves no run directory"; fi
+
+# it is only useful as a containment check if it SHOWS the containment
+for needle in "read-only" "MCPTool(*)" "bypassPermissions"; do
+  if grep -qF -- "$needle" <<<"$dry_out"; then ok "dry-run shows $needle"
+  else no "dry-run output omits $needle"; fi
+done
+
+# and the guards must still refuse when --dry-run is present
+refuse "dry-run-still-refuses-conflict" \
+  "--read and --worktree conflict" \
+  run --read --worktree w --dry-run -- x
+refuse "dry-run-still-refuses-traversal" \
+  "must match" \
+  run --worktree 'a/../../x' --dry-run -- x
+refuse "dry-run-still-refuses-temp-cwd" \
+  "every sandbox profile leaves writable" \
+  run --read --cwd /tmp --dry-run -- x
+
 # macOS puts TMPDIR under /var/folders. The pattern list matched that path only
 # through the $TMPDIR pattern, so any context that does not export TMPDIR --
 # cron, launchd, `env -u TMPDIR` -- accepted a --read cwd on a directory every

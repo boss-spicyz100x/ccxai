@@ -33,12 +33,36 @@ full file of work, the brief costs more than the task — just do it yourself.
 GOAL        one sentence, testable
 FILES       exact paths + one line each on why they matter (paths, NOT contents)
 CONSTRAINTS what not to touch; invariants to preserve
-ACCEPTANCE  the literal command that must pass
+DECIDED     choices already made, so the worker does not re-litigate them
+AMBIGUITY   what to do when the spec runs out (assume-and-continue, or stop)
+ACCEPTANCE  the literal command that must pass, and its expected exit
 DELIVERABLE what to put in the envelope
 ```
 
 A vague brief is the documented failure mode of orchestrator-worker systems. Spend real
 effort here — the brief *is* the interface.
+
+**DECIDED and AMBIGUITY exist because of what the runs actually returned.** 24% of
+envelopes came back carrying `open_questions`, and they were not failures — the worker did
+the job and then asked. What it asked was always the same shape:
+
+- *"should `parse_ratio('1.5/2')` be accepted, or stay a ValueError?"* — an edge-case policy
+  that belonged in CONSTRAINTS
+- *"need a follow-up turn to add the tests and run the three acceptance steps"* — an
+  ACCEPTANCE that named a command but not the whole bar
+- *"whether char101/char201–222 are playable, so `2**character` may overflow"* — a domain
+  fact the worker had no way to know
+
+Each one costs a `ccx cont` round, which is the expensive way to answer a question you
+could have answered in the brief. So:
+
+- **DECIDED** — state the calls you have already made. Workers re-open settled questions
+  when nothing tells them the question is closed.
+- **AMBIGUITY** — say explicitly whether to assume-and-continue (and record the assumption
+  in `evidence`) or to stop and report. Silence here is what turns a finished task into a
+  question.
+- **ACCEPTANCE** — a literal command *and* what its output must look like. "the tests pass"
+  is not a bar; `cd app && bun run test` exiting 0 is.
 
 ## Commands
 

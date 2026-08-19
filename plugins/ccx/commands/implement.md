@@ -9,7 +9,9 @@ Delegate implementation of **$ARGUMENTS** to a Grok 4.6 worker.
 1. Work out the acceptance command first (the test/build/lint that must pass). If there
    isn't one, say so and propose one — a task with no acceptance criterion should not be
    delegated.
-2. Write the brief (GOAL/FILES/CONSTRAINTS/ACCEPTANCE/DELIVERABLE). Paths, not contents.
+2. Write the brief (GOAL/FILES/CONSTRAINTS/DECIDED/AMBIGUITY/ACCEPTANCE/DELIVERABLE).
+   Paths, not contents. DECIDED and AMBIGUITY are not optional: 24% of runs came back
+   asking a question the brief could have answered, and each one costs a `ccx cont` round.
    State explicitly what must NOT be touched — especially the test files.
 3. Dispatch into an isolated worktree:
    `${CLAUDE_PLUGIN_ROOT}/bin/ccx run --worktree <short-name> --label <short-name> --task <brief> --check`

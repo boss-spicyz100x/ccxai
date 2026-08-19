@@ -249,6 +249,7 @@ OPTIONS
   --concurrency N   fanout only: max workers in flight at once (default 4)
   --raw             print only the envelope JSON (no header)
   --check           require the worker to verify its own work before returning
+  --dry-run         run every guard, print the resolved invocation, dispatch nothing
 
 EXIT CODES
   0 done|partial   3 blocked   4 timeout   5 worker/parse error
@@ -291,7 +292,7 @@ case "$SUB" in -h|--help|help) usage; exit 0 ;; -v|--version) echo "ccx $VERSION
 PROFILE=read; PROFILE_SET=0; CWD_SET=0; MCP=0
 TASK_FILE=""; BRIEF=""; CWD="$PWD"; WORKTREE=""; REF="HEAD"
 SCHEMA_FILE=""; USE_SCHEMA=1; MAX_TURNS=""; TOOLS=""; WEB=0; LABEL=""
-RAW=0; CHECK=0; SESSION=""; SHOW_WHAT="envelope"; LSN=15; SCHEMA_INLINE=0
+RAW=0; CHECK=0; SESSION=""; SHOW_WHAT="envelope"; LSN=15; SCHEMA_INLINE=0; DRY_RUN=0
 BRIEFS=""; CONCURRENCY=4
 DAYS=""; LABELF=""; EXPORT_ALL=0
 declare -a XALLOW=() XDENY=()
@@ -321,6 +322,7 @@ while [[ $# -gt 0 ]]; do
     --concurrency) CONCURRENCY="${2:?}"; shift 2 ;;
     --raw)        RAW=1; shift ;;
     --check)      CHECK=1; shift ;;
+    --dry-run)    DRY_RUN=1; shift ;;
     --session)    SESSION="${2:?}"; shift 2 ;;
     -n)           LSN="${2:?}"; shift 2 ;;
     --days)       DAYS="${2:?}"; shift 2 ;;
@@ -875,6 +877,27 @@ else
   # on timeout there IS no output, and an unaddressable session means the work is lost.
   PRESET_SID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
   ARGS+=(-s "$PRESET_SID")
+fi
+
+# ---------- --dry-run ----------
+# Every guard above has already run, so this exercises the refusal paths for free.
+# The regression checks in CLAUDE.md carry a live brief (`-- x`), so before this
+# existed any guard that failed to refuse dispatched a REAL worker: that is how
+# two runs cost $0.047 asking what "x" meant. Placed after argv assembly and
+# before the run directory, so a dry run leaves nothing behind.
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  {
+    printf 'ccx: dry run -- nothing dispatched, no run directory, no cost\n'
+    printf '  profile    %s (sandbox %s)\n' "$PROFILE" "$SANDBOX"
+    printf '  cwd        %s\n' "$CWD"
+    printf '  model      %s / effort %s / timeout %ss / max-turns %s\n' \
+      "$MODEL" "$EFFORT" "$TIMEOUT" "${MAX_TURNS:-default}"
+    printf '  session    %s\n' "$PRESET_SID"
+    printf '  brief      %s bytes\n' "$(printf '%s' "$BRIEF" | wc -c | tr -d ' ')"
+    printf '  %s\n' "$GROK_BIN"
+    for _a in ${ARGS+"${ARGS[@]}"}; do printf '    %s\n' "$_a"; done
+  }
+  exit 0
 fi
 
 # ---------- run dir ----------

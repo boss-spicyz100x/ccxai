@@ -106,10 +106,14 @@ running the whole suite with `CCX=~/.local/bin/ccx` (97 assertions, all green).
   errors that look like real syntax bugs. This wasted a debugging cycle already.
 - Regression-check the guard rails after any edit — all three must fail *before* dispatch:
 
-      ccx run --read --worktree w -- x          # profile conflict
-      ccx run --worktree 'a/../../x' -- x       # path traversal
-      ccx run --read --cwd /tmp -- x            # temp-path cwd
-      ccx run --read --cwd "$TMPDIR" -- x       # temp-path cwd via /var/folders
+      ccx run --read --worktree w --dry-run -- x       # profile conflict
+      ccx run --worktree 'a/../../x' --dry-run -- x    # path traversal
+      ccx run --read --cwd /tmp --dry-run -- x         # temp-path cwd
+      ccx run --read --cwd "$TMPDIR" --dry-run -- x    # temp-path cwd via /var/folders
+
+  Use `--dry-run`. These commands carry a live brief, so before it existed a guard that
+  stopped refusing dispatched a real worker — two runs cost $0.047 asking what "x" meant.
+  `--dry-run` runs every guard, prints the resolved invocation, and dispatches nothing.
 
 - Tests must parse under **bash 3.2** — that is `/bin/bash` on macOS, and it has no
   `mapfile`/`readarray`. Check with `/bin/bash -n tests/*.sh`; the nix bash on PATH is 5.x and

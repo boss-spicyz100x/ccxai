@@ -88,6 +88,10 @@ RC=$?'
 _breaker_check'
 'command -v timeout >/dev/null 2>&1 || die "timeout(1) not found -- install coreutils (brew install coreutils) or provide gtimeout"'
 
+"dry-run-dispatches-anyway" "guard-rails.sh"
+'if [[ "$DRY_RUN" -eq 1 ]]; then'
+'if false; then'
+
 "fanout-ignores-quota-breaker" "quota.sh"
 '    if [[ -f "$(_breaker_file)" ]]; then
       SKIPPED+=("$slug")
