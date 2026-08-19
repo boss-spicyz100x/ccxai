@@ -69,6 +69,17 @@ Do not "simplify" these away. Every one was found by using the tool, not by read
   worker that died before creating its run dir reported an *older* run's turns/cost/seconds
   and that stale cost entered the fanout total.
 
+## Installing
+
+`./install.sh` symlinks `plugins/ccx/bin/ccx` into `~/.local/bin`. Do not add the repo's
+`bin` directory to PATH: the Claude Code plugin loader already does that for its own
+sessions, which is exactly why `ccx` appeared to be installed while every normal shell
+still needed the absolute path.
+
+The symlink is safe because `ccx` resolves nothing relative to itself — the only use of
+`$0` is fanout re-invoking the dispatcher, which works through a symlink. Verified by
+running the whole suite with `CCX=~/.local/bin/ccx` (97 assertions, all green).
+
 ## Changing ccx
 
 - **Never edit `bin/ccx` while a run is in flight.** Bash reads scripts lazily by byte

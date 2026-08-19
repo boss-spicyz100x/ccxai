@@ -22,14 +22,23 @@ key and bills separately.
 ## Install
 
 ```bash
-# in Claude Code
-/plugin marketplace add ~/Documents/personal/research/ccxai
-/plugin install ccx@ccxai
-
-# or just put the dispatcher on PATH
-ln -s ~/Documents/personal/research/ccxai/plugins/ccx/bin/ccx ~/.local/bin/ccx
+./install.sh          # symlinks ccx into ~/.local/bin (or CCX_PREFIX)
 ccx doctor
 ```
+
+Installing the Claude Code plugin puts `plugins/ccx/bin` on PATH **for Claude Code
+sessions only** — every other shell still needs the full path to the script:
+
+```bash
+# in Claude Code, for the /ccx:* skills and the grok-worker agent
+/plugin marketplace add ~/Documents/personal/research/ccxai
+/plugin install ccx@ccxai
+```
+
+`install.sh` links rather than copies, so edits to the repo are live; a stale copy
+on PATH is its own class of bug. It refuses to overwrite anything that is not a
+symlink, tells you if the target directory is not on PATH, and takes
+`--uninstall`.
 
 ## Use
 
