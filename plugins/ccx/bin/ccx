@@ -132,7 +132,11 @@ _terminal_meta() {
 # The dispatch runs in the background and is waited on, so this handler fires.
 _on_signal() {
   local sig="$1" i
-  trap - INT TERM
+  # IGNORE rather than reset. `trap -` restores the default action, so a second
+  # SIGTERM arriving during the 10s grace killed ccx before _terminal_meta ran --
+  # leaving meta at "running" and nothing in runs.jsonl, the exact state this
+  # handler exists to prevent.
+  trap '' INT TERM
   if [[ -n "${WORKER_PID:-}" ]]; then
     # Signal grok directly as well as the timeout(1) wrapper. Killing only the
     # wrapper leaves the worker running, and SIGKILLing the wrapper after two
@@ -661,6 +665,12 @@ if [[ "$SUB" == "fanout" ]]; then
     # A skipped brief has no result file at all. sed on a missing file exits
     # non-zero and pipefail turns that into a set -e abort mid-table -- the same
     # failure already fixed for the run-dir lookup. Report it and move on.
+    # A dry run produces no envelope, so judging it by .status marked every brief
+    # failed and fanout exited 1 on a successful dry run.
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      printf '%-24s %-9s %6s %8s %7s\n' "${slug:0:24}" "dry-run" "-" "-" "-"
+      continue
+    fi
     if printf '%s\n' ${SKIPPED+"${SKIPPED[@]}"} | grep -qxF "$slug"; then
       printf '%-24s %-9s %6s %8s %7s\n' "${slug:0:24}" "skipped" "-" "-" "-"
       rc=6
@@ -810,7 +820,10 @@ if [[ -n "$WORKTREE" ]]; then
   REPO="$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)" || die "--worktree needs a git repo at $CWD"
   WT="$CCX_HOME/worktrees/$(basename "$REPO")-$WORKTREE"
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    CWD="$WT"                      # so the printed invocation is the real one
+    # Report the path without becoming it. Assigning CWD="$WT" made the very next
+    # `[[ -d "$CWD" ]]` guard fail on the directory we had just declined to
+    # create, so --dry-run --worktree died at exit 2 instead of printing.
+    WOULD_WT="$WT"
   elif [[ -d "$WT" ]]; then
     # A pre-existing directory that is not our worktree would silently become the
     # write target, defeating the isolation the flag promises.
@@ -829,7 +842,10 @@ if [[ -n "$WORKTREE" ]]; then
       || git -C "$REPO" worktree add "$WT" "$REF" >/dev/null \
       || die "could not create worktree $WT"
   fi
-  CWD="$WT"
+  # Not under --dry-run: this assignment runs AFTER the branch above, so skipping
+  # creation was not enough -- CWD still became a directory that does not exist,
+  # and the guard below then killed the dry run at exit 2.
+  [[ "$DRY_RUN" -eq 1 ]] || CWD="$WT"
 fi
 [[ -d "$CWD" ]] || die "no such directory: $CWD"
 CWD="$(cd "$CWD" && pwd)"
@@ -915,6 +931,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     printf 'ccx: dry run -- nothing dispatched, no run directory, no cost\n'
     printf '  profile    %s (sandbox %s)\n' "$PROFILE" "$SANDBOX"
     printf '  cwd        %s\n' "$CWD"
+    [[ -n "${WOULD_WT:-}" ]] && printf '  worktree   %s (would be created)\n' "$WOULD_WT"
     printf '  model      %s / effort %s / timeout %ss / max-turns %s\n' \
       "$MODEL" "$EFFORT" "$TIMEOUT" "${MAX_TURNS:-default}"
     printf '  session    %s\n' "$PRESET_SID"

@@ -153,7 +153,14 @@ refuse "dry-run-still-refuses-temp-cwd" \
 # short-circuit sits after argv assembly, which is after worktree creation, so
 # `--dry-run --worktree` used to create a real worktree and branch.
 WT_NAME="drynothing$$"
-CCX_HOME="$T/wthome" "$CCX" run --write --worktree "$WT_NAME" --dry-run -- probe >/dev/null 2>&1 || true
+# Assert the EXIT CODE too. "creates no worktree" passes trivially when the command
+# dies early -- and it did: setting CWD to the uncreated worktree made the next
+# `[[ -d "$CWD" ]]` guard kill the dry run at exit 2, while this test stayed green.
+wt_out=$(CCX_HOME="$T/wthome" "$CCX" run --write --worktree "$WT_NAME" --dry-run -- probe 2>&1) && wt_rc=0 || wt_rc=$?
+[[ "$wt_rc" -eq 0 ]] && ok "dry-run --worktree exits 0" \
+  || no "dry-run --worktree must exit 0 (got $wt_rc): $(tail -1 <<<"$wt_out")"
+grep -q "would be created" <<<"$wt_out" && ok "dry-run names the worktree it would create" \
+  || no "dry-run must report the worktree path it would use"
 if [[ -d "$T/wthome/worktrees" ]] && ls "$T/wthome/worktrees" 2>/dev/null | grep -q "$WT_NAME"; then
   no "dry-run must not create a git worktree"
 else ok "dry-run creates no worktree"; fi
@@ -171,7 +178,10 @@ else ok "dry-run creates no branch"; fi
 # every brief for real.
 FB="$T/drybriefs"; mkdir -p "$FB"; echo "GOAL a" > "$FB/a.md"; echo "GOAL b" > "$FB/b.md"
 : > "$LOG"
-CCX_HOME="$T/fdry" "$CCX" fanout --cwd "$ROOT" --briefs "$FB" --read --dry-run >/dev/null 2>&1 || true
+CCX_HOME="$T/fdry" "$CCX" fanout --cwd "$ROOT" --briefs "$FB" --read --dry-run >/dev/null 2>&1 && fdry_rc=0 || fdry_rc=$?
+# a dry run produces no envelope, so fanout judging briefs by .status exited 1
+[[ "$fdry_rc" -eq 0 ]] && ok "fanout --dry-run exits 0" \
+  || no "fanout --dry-run must exit 0 (got $fdry_rc)"
 if [[ -s "$LOG" ]]; then no "fanout --dry-run must not invoke grok"
 else ok "fanout --dry-run does not invoke grok"; fi
 if [[ -d "$T/fdry/runs" ]] && [[ -n "$(ls -A "$T/fdry/runs" 2>/dev/null)" ]]; then

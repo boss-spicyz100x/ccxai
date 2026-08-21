@@ -220,4 +220,41 @@ else
   else no "a phase-2 signal must reach runs.jsonl"; fi
 fi
 
+# --- 7. a SECOND signal during cleanup must not lose the record -----------------
+# _on_signal used `trap - INT TERM`, restoring the DEFAULT action, so a second
+# SIGTERM arriving during the 10s grace killed ccx before _terminal_meta ran and
+# left meta at "running" with nothing in runs.jsonl.
+cat > "$T/grok-stub2" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  --version) echo "grok 0.0.0 (stub)"; exit 0 ;;
+  --help)    echo "--json-schema --sandbox --permission-mode --resume --tools"; exit 0 ;;
+esac
+trap '' TERM            # ignore TERM so ccx must wait out its grace period
+echo $$ > "$STUB_PIDFILE"
+sleep 120
+STUB
+chmod +x "$T/grok-stub2"
+H8="$T/h8"; PF2="$T/w2.pid"
+STUB_PIDFILE="$PF2" CCX_HOME="$H8" GROK_BIN="$T/grok-stub2" \
+  "$CCX" run --read --cwd "$ROOT" --timeout 300 -- probe >/dev/null 2>&1 &
+C2=$!
+for _ in $(seq 1 60); do [[ -s "$PF2" ]] && break; /bin/sleep 0.2; done
+W2=$(cat "$PF2" 2>/dev/null || echo "")
+if [[ -z "$W2" ]]; then
+  no "setup: second-signal worker never started"; kill -TERM "$C2" 2>/dev/null || true
+else
+  kill -TERM "$C2" 2>/dev/null || true      # enters the grace period
+  /bin/sleep 1
+  kill -TERM "$C2" 2>/dev/null || true      # the one that used to be fatal
+  wait "$C2" 2>/dev/null || true
+  st=$(jq -r '.status' "$H8"/runs/*/meta.json 2>/dev/null | head -1)
+  [[ "$st" == "killed" ]] && ok "a second signal during cleanup still records killed" \
+    || no "second signal lost the record (status '${st:-none}')"
+  if [[ -f "$H8/runs.jsonl" ]] && jq -e 'select(.status=="killed")' "$H8/runs.jsonl" >/dev/null 2>&1; then
+    ok "a second signal still reaches runs.jsonl"
+  else no "a second signal must still reach runs.jsonl"; fi
+  kill -9 "$W2" 2>/dev/null || true
+fi
+
 exit "$fail"

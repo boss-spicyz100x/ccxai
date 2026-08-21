@@ -75,15 +75,30 @@ RC=$?'
 '  --output-format json "${ARGS[@]}" >"$D/raw.json" 2>"$D/stderr.log"
 RC=$?'
 
+"dry-run-worktree-sets-cwd" "guard-rails.sh"
+'  [[ "$DRY_RUN" -eq 1 ]] || CWD="$WT"'
+'  CWD="$WT"'
+
+"fanout-dry-run-judged-by-envelope" "guard-rails.sh"
+'    if [[ "$DRY_RUN" -eq 1 ]]; then
+      printf '"'"'%-24s %-9s %6s %8s %7s\n'"'"' "${slug:0:24}" "dry-run" "-" "-" "-"
+      continue
+    fi'
+'    :'
+
+"second-signal-resets-trap" "recovery.sh"
+"  trap '' INT TERM"
+'  trap - INT TERM'
+
 "fanout-dry-run-not-forwarded" "guard-rails.sh"
 '  [[ "$DRY_RUN" -eq 1 ]] && FWD+=(--dry-run)'
 '  :'
 
 "dry-run-still-builds-worktree" "guard-rails.sh"
 '  if [[ "$DRY_RUN" -eq 1 ]]; then
-    CWD="$WT"                      # so the printed invocation is the real one
-  elif [[ -d "$WT" ]]; then'
-'  if [[ -d "$WT" ]]; then'
+    # Report the path without becoming it.'
+'  if false; then
+    # Report the path without becoming it.'
 
 "fanout-ignores-breaker-ttl" "quota.sh"
 '    if _breaker_active; then'
