@@ -134,13 +134,18 @@ _on_signal() {
   local sig="$1" i
   trap - INT TERM
   if [[ -n "${WORKER_PID:-}" ]]; then
-    kill -TERM "$WORKER_PID" 2>/dev/null || true
-    # timeout(1) forwards TERM to grok; give that a moment, then insist
-    for i in 1 2 3 4 5 6 7 8 9 10; do
+    # Signal grok directly as well as the timeout(1) wrapper. Killing only the
+    # wrapper leaves the worker running, and SIGKILLing the wrapper after two
+    # seconds cancelled the very --kill-after escalation that would have killed
+    # grok -- so the "insist" step was orphaning the process it meant to stop.
+    pkill -TERM -P "$WORKER_PID" 2>/dev/null || true
+    kill  -TERM "$WORKER_PID"    2>/dev/null || true
+    for i in $(seq 1 50); do          # 10s: grok flushes its session on TERM
       kill -0 "$WORKER_PID" 2>/dev/null || break
       sleep 0.2
     done
-    kill -KILL "$WORKER_PID" 2>/dev/null || true
+    pkill -KILL -P "$WORKER_PID" 2>/dev/null || true
+    kill  -KILL "$WORKER_PID"    2>/dev/null || true
   fi
   ELAPSED=$(( $(date +%s) - ${START:-$(date +%s)} ))
   _terminal_meta killed "$([[ "$sig" == INT ]] && echo 130 || echo 143)" \
@@ -185,10 +190,21 @@ _breaker_age() {
   [[ -f "$f" ]] || { echo -1; return; }
   echo $(( $(date +%s) - $(_mtime "$f") ))
 }
+# True only while a breaker is LIVE. fanout used to test `-f` on the file alone,
+# so an expired block kept skipping every brief while `ccx run` sailed past it --
+# two entry points disagreeing about the same state.
+_breaker_active() {
+  local age; age=$(_breaker_age)
+  (( age < 0 )) && return 1
+  if (( age >= ${CCX_BREAKER_TTL:-900} )); then
+    rm -f "$(_breaker_file)" 2>/dev/null || true; return 1
+  fi
+  return 0
+}
 _breaker_check() {   # refuse fast while the breaker is warm
   local age; age=$(_breaker_age)
-  (( age < 0 )) && return 0
-  if (( age >= ${CCX_BREAKER_TTL:-900} )); then rm -f "$(_breaker_file)" 2>/dev/null || true; return 0; fi
+  if ! _breaker_active; then return 0; fi
+  age=$(_breaker_age)
   {
     echo "ccx: refusing to dispatch -- a run $(( age / 60 ))m ago failed on quota/auth."
     echo "     $(sed -n 2p "$(_breaker_file)" 2>/dev/null)"
@@ -573,6 +589,9 @@ if [[ "$SUB" == "fanout" ]]; then
   [[ "$WEB" -eq 1 ]] && FWD+=(--web)
   [[ "$MCP" -eq 1 ]] && FWD+=(--mcp)
   [[ "$CHECK" -eq 1 ]] && FWD+=(--check)
+  # Without this, `fanout --dry-run` dispatched every brief for real: DRY_RUN is
+  # parsed globally but only the run path short-circuits on it.
+  [[ "$DRY_RUN" -eq 1 ]] && FWD+=(--dry-run)
   for r in ${XALLOW+"${XALLOW[@]}"}; do FWD+=(--allow "$r"); done
   for r in ${XDENY+"${XDENY[@]}"};  do FWD+=(--deny  "$r"); done
 
@@ -619,7 +638,7 @@ if [[ "$SUB" == "fanout" ]]; then
     # A quota/auth refusal is not per-brief: every remaining worker hits the same
     # wall. Checked AFTER the slot wait, because before it the run that arms the
     # breaker has only just been spawned and has not failed yet.
-    if [[ -f "$(_breaker_file)" ]]; then
+    if _breaker_active; then
       SKIPPED+=("$slug")
       continue
     fi
@@ -780,13 +799,19 @@ result in evidence[]. If verification fails and you cannot fix it, return status
 fi
 
 # ---------- worktree ----------
+# NOTE: --dry-run is checked inside this block rather than short-circuiting above
+# it, because the argv it prints is only assembled later. Creating a git worktree
+# and a branch is not "leaving nothing behind", which is the one promise the flag
+# makes.
 if [[ -n "$WORKTREE" ]]; then
   have git || die "git required for --worktree"
   case "$WORKTREE" in *[!A-Za-z0-9._-]*|""|.|..)
     die "--worktree name must match [A-Za-z0-9._-]+ (got: $WORKTREE)" ;; esac
   REPO="$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)" || die "--worktree needs a git repo at $CWD"
   WT="$CCX_HOME/worktrees/$(basename "$REPO")-$WORKTREE"
-  if [[ -d "$WT" ]]; then
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    CWD="$WT"                      # so the printed invocation is the real one
+  elif [[ -d "$WT" ]]; then
     # A pre-existing directory that is not our worktree would silently become the
     # write target, defeating the isolation the flag promises.
     git -C "$WT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
@@ -983,14 +1008,24 @@ STOP=$(jq -r '.stopReason // "?"' "$D/raw.json")
 if [[ "$USE_SCHEMA" -eq 1 && "$SCHEMA_INLINE" -eq 0 && -n "$SID" ]]; then
   mv "$D/raw.json" "$D/raw1.json"
   set +e
+  # Phase 2 gets the same treatment as phase 1. It used to run foreground with
+  # the traps already cleared, so a SIGTERM during the format pass orphaned grok,
+  # left meta at "running" and wrote nothing to runs.jsonl -- the exact failure
+  # the phase-1 handling was added to prevent.
+  trap '_on_signal TERM' TERM
+  trap '_on_signal INT'  INT
   timeout --kill-after=15s 180 "$GROK_BIN" --no-auto-update \
     -p "Now return the result of the work you just did as JSON matching the required schema. Base it ENTIRELY on what you already found; do not investigate further and do not use any tools. If you did not actually complete the work, say so honestly with status=partial or blocked rather than returning an empty result." \
     --cwd "$CWD" -m "$MODEL" --reasoning-effort low --resume "$SID" \
     ${SAFE+"${SAFE[@]}"} \
     --max-turns 1 --json-schema "$SCHEMA" --output-format json \
-    >"$D/raw2.json" 2>>"$D/stderr.log"
+    >"$D/raw2.json" 2>>"$D/stderr.log" &
+  WORKER_PID=$!
+  wait "$WORKER_PID"
   RC2=$?
+  WORKER_PID=""
   set -e
+  trap - INT TERM
   P2_SECONDS=$(( $(date +%s) - START - P1_SECONDS ))
   [[ $RC2 -ne 0 ]] && WARN+=("phase2-format-failed")
   if [[ $RC2 -eq 0 ]] && jq -e '.structuredOutput' >/dev/null 2>&1 <"$D/raw2.json"; then

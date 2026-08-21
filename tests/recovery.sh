@@ -180,4 +180,44 @@ else
   wait "$FPID" 2>/dev/null || true
 fi
 
+# --- 6. SIGTERM during PHASE 2 must also take the worker down -------------------
+# Phase 1 was backgrounded and trapped; phase 2 was not, and the traps had already
+# been cleared -- so a signal during the format pass orphaned grok, left meta at
+# "running" and wrote nothing to runs.jsonl. Found by a worker review, not by this
+# suite, which only ever hung phase 1.
+cat > "$T/grok-p2" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  --version) echo "grok 0.0.0 (stub)"; exit 0 ;;
+  --help)    echo "--json-schema --sandbox --permission-mode --resume --tools"; exit 0 ;;
+esac
+for a in "$@"; do [[ "$a" == "--resume" ]] && { echo $$ > "$STUB_PID2"; sleep 120; exit 0; }; done
+echo '{"text":"{}","stopReason":"end_turn","sessionId":"11111111-2222-3333-4444-555555555555","num_turns":2,"total_cost_usd":0.01,"usage":{}}'
+STUB
+chmod +x "$T/grok-p2"
+H7="$T/h7"; P2="$T/p2.pid"
+STUB_PID2="$P2" CCX_HOME="$H7" GROK_BIN="$T/grok-p2" \
+  "$CCX" run --read --cwd "$ROOT" -- probe >/dev/null 2>&1 &
+CPID=$!
+for _ in $(seq 1 80); do [[ -s "$P2" ]] && break; /bin/sleep 0.25; done
+WPID2=$(cat "$P2" 2>/dev/null || echo "")
+
+if [[ -z "$WPID2" ]]; then
+  no "setup: phase 2 never started"
+  kill -TERM "$CPID" 2>/dev/null || true
+else
+  kill -TERM "$CPID" 2>/dev/null || true
+  gone=0
+  for _ in $(seq 1 40); do kill -0 "$WPID2" 2>/dev/null || { gone=1; break; }; /bin/sleep 0.25; done
+  if [[ "$gone" -eq 1 ]]; then ok "SIGTERM during phase 2 terminates the worker"
+  else no "phase-2 worker was orphaned"; kill -9 "$WPID2" 2>/dev/null || true; fi
+  wait "$CPID" 2>/dev/null || true
+  st=$(jq -r '.status' "$H7"/runs/*/meta.json 2>/dev/null | head -1)
+  [[ "$st" == "killed" ]] && ok "a phase-2 signal is recorded as killed" \
+    || no "phase-2 signal must record killed (got '${st:-none}')"
+  if [[ -f "$H7/runs.jsonl" ]] && jq -e 'select(.status=="killed")' "$H7/runs.jsonl" >/dev/null 2>&1; then
+    ok "a phase-2 signal reaches runs.jsonl"
+  else no "a phase-2 signal must reach runs.jsonl"; fi
+fi
+
 exit "$fail"

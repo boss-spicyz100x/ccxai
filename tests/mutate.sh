@@ -75,6 +75,26 @@ RC=$?'
 '  --output-format json "${ARGS[@]}" >"$D/raw.json" 2>"$D/stderr.log"
 RC=$?'
 
+"fanout-dry-run-not-forwarded" "guard-rails.sh"
+'  [[ "$DRY_RUN" -eq 1 ]] && FWD+=(--dry-run)'
+'  :'
+
+"dry-run-still-builds-worktree" "guard-rails.sh"
+'  if [[ "$DRY_RUN" -eq 1 ]]; then
+    CWD="$WT"                      # so the printed invocation is the real one
+  elif [[ -d "$WT" ]]; then'
+'  if [[ -d "$WT" ]]; then'
+
+"fanout-ignores-breaker-ttl" "quota.sh"
+'    if _breaker_active; then'
+'    if [[ -f "$(_breaker_file)" ]]; then'
+
+"phase2-signal-handling-dropped" "recovery.sh"
+'  trap '"'"'_on_signal TERM'"'"' TERM
+  trap '"'"'_on_signal INT'"'"'  INT
+  timeout --kill-after=15s 180'
+'  timeout --kill-after=15s 180'
+
 "fanout-signal-cascade-dropped" "recovery.sh"
 "  trap '_fanout_signal TERM' TERM"
 '  :'
@@ -93,7 +113,7 @@ _breaker_check'
 'if false; then'
 
 "fanout-ignores-quota-breaker" "quota.sh"
-'    if [[ -f "$(_breaker_file)" ]]; then
+'    if _breaker_active; then
       SKIPPED+=("$slug")
       continue
     fi'

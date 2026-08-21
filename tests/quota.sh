@@ -100,4 +100,21 @@ started=$(ls "$H2"/runs 2>/dev/null | wc -l | tr -d ' ')
 if (( started < 4 )); then ok "fanout stops dispatching after a quota refusal ($started/4 started)"
 else no "fanout dispatched all $started briefs into the same quota wall"; fi
 
+# --- 5. an EXPIRED breaker must not block fanout --------------------------------
+# `ccx run` honoured the TTL but fanout tested only that the file existed, so a
+# stale block kept skipping every brief forever while a plain run sailed past it.
+H3="$T/h9"; mkdir -p "$H3"
+printf '2020-01-01T00:00:00Z\nold block\n' > "$H3/.quota-block"
+touch -t 202001010000 "$H3/.quota-block"
+B2="$T/briefs2"; mkdir -p "$B2"; for nm in p q; do echo "GOAL $nm" > "$B2/$nm.md"; done
+MK2="$T/dispatched2.log"; : > "$MK2"
+out=$(STUB_MARKER="$MK2" CCX_HOME="$H3" GROK_BIN="$T/grok-ok" "$CCX" fanout --cwd "$ROOT" \
+        --briefs "$B2" --read --concurrency 2 2>&1) && rc=0 || rc=$?
+if grep -qi 'NOT dispatched' <<<"$out"; then
+  no "an expired breaker must not make fanout skip briefs"
+else ok "an expired breaker does not block fanout"; fi
+started=$(ls "$H3"/runs 2>/dev/null | wc -l | tr -d ' ')
+(( started >= 2 )) && ok "fanout dispatched past the expired breaker ($started runs)" \
+  || no "fanout should have dispatched 2 briefs, started $started"
+
 exit "$fail"

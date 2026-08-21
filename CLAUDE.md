@@ -99,6 +99,18 @@ The symlink is safe because `ccx` resolves nothing relative to itself — the on
 `$0` is fanout re-invoking the dispatcher, which works through a symlink. Verified by
 running the whole suite with `CCX=~/.local/bin/ccx` (97 assertions, all green).
 
+- **Every flag and guard has TWO entry points: `run` and `fanout`.** Three of the five
+  defects in the first worker review were the same mistake — `--dry-run` and the quota
+  breaker were bolted onto `run` and never wired into `fanout`, which has its own dispatch
+  loop and its own copy of the decision. `fanout --dry-run` dispatched for real; an expired
+  breaker blocked fanout forever while `run` sailed past it. When you add a flag, grep for
+  `FWD+=` and ask what `fanout` does with it.
+- **Both phases need the signal handling, not just phase 1.** SIGTERM during the phase-2
+  format pass orphaned grok, left `meta.json` at "running" and wrote nothing to
+  `runs.jsonl` — the exact failure phase 1's handler exists to prevent. And do not SIGKILL
+  the `timeout(1)` wrapper to "insist": that cancels its own `--kill-after` escalation,
+  which is the thing that would have killed grok. Signal the child too (`pkill -P`).
+
 ## Changing ccx
 
 - **Never edit `bin/ccx` while a run is in flight.** Bash reads scripts lazily by byte

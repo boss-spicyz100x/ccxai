@@ -149,6 +149,35 @@ refuse "dry-run-still-refuses-temp-cwd" \
   "every sandbox profile leaves writable" \
   run --read --cwd /tmp --dry-run -- x
 
+# --dry-run must leave NOTHING behind, and that includes a git worktree. The
+# short-circuit sits after argv assembly, which is after worktree creation, so
+# `--dry-run --worktree` used to create a real worktree and branch.
+WT_NAME="drynothing$$"
+CCX_HOME="$T/wthome" "$CCX" run --write --worktree "$WT_NAME" --dry-run -- probe >/dev/null 2>&1 || true
+if [[ -d "$T/wthome/worktrees" ]] && ls "$T/wthome/worktrees" 2>/dev/null | grep -q "$WT_NAME"; then
+  no "dry-run must not create a git worktree"
+else ok "dry-run creates no worktree"; fi
+if git -C "$ROOT" worktree list 2>/dev/null | grep -q "$WT_NAME"; then
+  no "dry-run must not register a worktree with git"
+  git -C "$ROOT" worktree remove --force "$T/wthome/worktrees/$WT_NAME" 2>/dev/null || true
+else ok "dry-run registers no worktree with git"; fi
+if git -C "$ROOT" branch --list "ccx/$WT_NAME" 2>/dev/null | grep -q .; then
+  no "dry-run must not create a branch"
+  git -C "$ROOT" branch -D "ccx/$WT_NAME" >/dev/null 2>&1 || true
+else ok "dry-run creates no branch"; fi
+
+# fanout is a second entry point with its own dispatch path: DRY_RUN is parsed
+# globally but only `run` short-circuits on it, so `fanout --dry-run` dispatched
+# every brief for real.
+FB="$T/drybriefs"; mkdir -p "$FB"; echo "GOAL a" > "$FB/a.md"; echo "GOAL b" > "$FB/b.md"
+: > "$LOG"
+CCX_HOME="$T/fdry" "$CCX" fanout --cwd "$ROOT" --briefs "$FB" --read --dry-run >/dev/null 2>&1 || true
+if [[ -s "$LOG" ]]; then no "fanout --dry-run must not invoke grok"
+else ok "fanout --dry-run does not invoke grok"; fi
+if [[ -d "$T/fdry/runs" ]] && [[ -n "$(ls -A "$T/fdry/runs" 2>/dev/null)" ]]; then
+  no "fanout --dry-run must not create run directories"
+else ok "fanout --dry-run creates no run directories"; fi
+
 # macOS puts TMPDIR under /var/folders. The pattern list matched that path only
 # through the $TMPDIR pattern, so any context that does not export TMPDIR --
 # cron, launchd, `env -u TMPDIR` -- accepted a --read cwd on a directory every
